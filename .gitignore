@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+f5-tts-venv
+.omo/
+.codegraph
+.superpowers/
+backups/
