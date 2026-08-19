@@ -31,7 +31,7 @@ Expected duration: ~10 minutes. Check each box as it passes; note failures with 
 - [x] **2.5** ✅ Speed `5.0` → Save → inline error "speed must be between 0.5 and 2.0"; file not written; field kept `5.0` for correction. Log: `WARNING config save rejected: speed must be between 0.5 and 2.0`.
 - [x] **2.6** ✅ ffmpeg path `/no/such/ffmpeg` → Save → rejected; file not written. Log: `WARNING config save rejected: ffmpeg_path does not exist: /no/such/ffmpeg`.
 - [x] **2.7** ✅ Pilot tag `bad tag` (with space) → Save → inline error "pilot_tag must be non-empty with no whitespace"; file not written.
-- [ ] **2.8** ⏭️ Generate-with-new-speed — requires a real synthesis job; deferred (job argument passing is unit-tested).
+- [x] **2.8** ✅ Live end-to-end: tagged note `1786481994190`, ran scan → 1 job queued → F5-TTS synthesis (~49 s) → `[sound:neuroicu_tts_…mp3]` written to the note's Extra field, 67.6 KB mp3 in `collection.media`. Job used the saved settings profile (speed 1.0 digest).
 
 ## 3. Queue tab (G2)
 
@@ -54,13 +54,13 @@ Expected duration: ~10 minutes. Check each box as it passes; note failures with 
 - [x] **6.2** ✅ Full-Deck Convert → ImpactDialog: "This will queue TTS generation for **2872** note(s). Estimated runtime: about **1436** minute(s)." (Count matches the Overview Full-scope eligible count.)
 - [x] **6.3** ✅ Cancel → dialog dismissed; nothing enqueued (no queue log lines, counts unchanged).
 - [ ] **6.4** ⏭️ Confirm path not run — would enqueue 2872 real synthesis jobs. Unit-tested (including (2,3) dedupe proof).
-- [ ] **6.5** ⏭️ Re-run dedupe — unit-tested.
+- [x] **6.5** ✅ Dedupe verified live: with two pilot-tagged notes eligible, the scan queued exactly 1 — the already-generated note was skipped (content-hash + profile digest match), no duplicate job.
 
 ---
 
-## Result: PASS (19 verified live, 0 failures, 4 deliberately deferred to unit coverage)
+## Result: PASS (21 verified live, 0 failures, 3 deliberately deferred to unit coverage)
 
-Deferred: 0.2 (optional corrupt-config, unit-covered), 2.8 (generate-with-speed, needs note job), 5.2 (Clear Finished would delete real job history), 6.4/6.5 (full-deck confirm would enqueue 2872 real jobs; unit-tested with dedupe proof).
+Deferred: 0.2 (optional corrupt-config, unit-covered), 5.2 (Clear Finished would delete real job history), 6.4 (full-deck confirm would enqueue 2872 real jobs; unit-tested).
 
 **Integrity restored:** live `config.json` ends with your exact original values (speed 1.0, pilot_only true, pilot tag, all engine paths) in schema v2 form; no jobs enqueued; no notes touched.
 
