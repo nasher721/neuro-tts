@@ -1,0 +1,11 @@
+{
+  "f5_tts_repo": "",
+  "f5_tts_python": "python3",
+  "f5_model": "F5TTS_v1_Base",
+  "f5_ref_audio": "",
+  "f5_ref_text": "",
+  "f5_device": "cpu",
+  "f5_nfe_step": 16,
+  "pilot_only": true,
+  "pilot_tag": "neuroicu-tts-pilot"
+}

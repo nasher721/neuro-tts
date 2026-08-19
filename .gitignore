@@ -13,3 +13,5 @@ backups/
 *.db
 .beads-credential-key
 .beads/proxieddb/
+.specs/scratchpad/
+addon/neuroicu_tts.log
