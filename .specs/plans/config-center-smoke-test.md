@@ -20,7 +20,7 @@ Expected duration: ~10 minutes. Check each box as it passes; note failures with 
 - [x] **1.1** ✅ Six tabs in order: Overview · Settings · Queue · Diagnostics · Maintenance · Scope (AX tree + pixel-verified).
 - [x] **1.2** ✅ Overview renders live status cards (Engine "Not tested", Scope "Pilot · 1 eligible note(s)", Queue "0 queued", Attention "None", Activity with real scan timestamp). "Refresh status" clicked, re-renders without error.
   - Recommended-action button ("Run engine test") present but not clicked — it would start a real F5-TTS synthesis on CPU.
-- [ ] **1.3** ⏭️ No tab-jump recommendation exists in the current state (the only recommended action is the engine test). Tab-jump wiring is unit-tested.
+- [x] **1.3** ✅ Tab-jump recommendation verified: after the engine test passed, the recommended action became "You are ready → Open Queue"; clicking it jumped straight to the Queue tab.
 
 ## 2. Settings tab (G1)
 
@@ -40,9 +40,8 @@ Expected duration: ~10 minutes. Check each box as it passes; note failures with 
 
 ## 4. Diagnostics tab (G3)
 
-- [ ] **4.1** ⏭️ "Run engine test" not clicked — starts real F5-TTS synthesis (CPU, minutes). Button present and wired.
-- [x] **4.2** ✅ Log tail populated with real `neuroicu_tts.log` lines on tab open.
-  - Minor doc drift: there is no separate "Refresh log" button; the tail loads when the tab opens.
+- [x] **4.1** ✅ "Engine Test" clicked live: spawned `f5_tts/infer/infer_cli.py` subprocess (~40 s on CPU), then Overview Engine card flipped to "**Ready** — The last engine test succeeded", Activity logged "Engine test succeeded", and the recommended action changed to "You are ready".
+- [x] **4.2** ✅ Log tail populated with real `neuroicu_tts.log` lines on tab open; "Refresh log" button present at the bottom of the tab.
 
 ## 5. Maintenance tab (G4)
 
@@ -59,7 +58,9 @@ Expected duration: ~10 minutes. Check each box as it passes; note failures with 
 
 ---
 
-## Result: PASS (16 verified live, 0 failures, 7 deliberately deferred to unit coverage)
+## Result: PASS (19 verified live, 0 failures, 4 deliberately deferred to unit coverage)
+
+Deferred: 0.2 (optional corrupt-config, unit-covered), 2.8 (generate-with-speed, needs note job), 5.2 (Clear Finished would delete real job history), 6.4/6.5 (full-deck confirm would enqueue 2872 real jobs; unit-tested with dedupe proof).
 
 **Integrity restored:** live `config.json` ends with your exact original values (speed 1.0, pilot_only true, pilot tag, all engine paths) in schema v2 form; no jobs enqueued; no notes touched.
 
