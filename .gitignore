@@ -15,3 +15,5 @@ backups/
 .beads/proxieddb/
 .specs/scratchpad/
 addon/neuroicu_tts.log
+vendor/F5-TTS/
+neuroicu-tts-project-config-center/
