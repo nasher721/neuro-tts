@@ -34,6 +34,15 @@ class PackageParityTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_published_archive_matches_the_source_tree(self):
+        # A present .ankiaddon must be current: it is the file users install,
+        # and it previously went stale without any check noticing.
+        self.assertEqual(
+            package.stale_archive(),
+            [],
+            "packages/neuroicu_tts_addon.ankiaddon is out of date; run: python3 tools/package.py --zip",
+        )
+
     def test_tests_are_never_shipped_to_users(self):
         shipped = {path.name for path in package.shipped_files()}
         self.assertFalse([name for name in shipped if name.startswith("test_")])

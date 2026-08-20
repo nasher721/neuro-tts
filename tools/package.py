@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import filecmp
+import hashlib
 import shutil
 import sys
 import zipfile
@@ -63,6 +64,30 @@ def stale_files() -> list[str]:
     return sorted(differences)
 
 
+def stale_archive() -> list[str]:
+    """Return archive members that no longer match the source tree.
+
+    The archive is an optional distribution artifact, so a missing one is not
+    an error -- but a *present* one must be current.  Without this check the
+    archive silently kept whatever was in it the last time --zip ran, which
+    once shipped a build missing a worker fix that was already in the source.
+    """
+    if not ARCHIVE.exists():
+        return []
+    expected = {path.name: path for path in shipped_files()}
+    differences = []
+    with zipfile.ZipFile(ARCHIVE) as archive:
+        packed = set(archive.namelist())
+        for name in sorted(packed):
+            source = expected.get(name)
+            if source is None:
+                differences.append(f"{name} (unexpected in archive)")
+            elif hashlib.sha256(archive.read(name)).digest() != hashlib.sha256(source.read_bytes()).digest():
+                differences.append(f"{name} (stale in archive)")
+    differences.extend(f"{name} (missing from archive)" for name in sorted(set(expected) - packed))
+    return differences
+
+
 def build() -> list[str]:
     """Copy the shipped source files into the package directory."""
     PACKAGE.mkdir(parents=True, exist_ok=True)
@@ -94,10 +119,16 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.check:
         stale = stale_files()
-        if stale:
-            print("Package is out of date. Run: python3 tools/package.py", file=sys.stderr)
-            for name in stale:
-                print(f"  - {name}", file=sys.stderr)
+        stale_zip = stale_archive()
+        if stale or stale_zip:
+            if stale:
+                print("Package is out of date. Run: python3 tools/package.py", file=sys.stderr)
+                for name in stale:
+                    print(f"  - {name}", file=sys.stderr)
+            if stale_zip:
+                print("Archive is out of date. Run: python3 tools/package.py --zip", file=sys.stderr)
+                for name in stale_zip:
+                    print(f"  - {name}", file=sys.stderr)
             return 1
         print(f"Package is up to date ({len(shipped_files())} files).")
         return 0
