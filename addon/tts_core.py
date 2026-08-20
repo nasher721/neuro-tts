@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import html
 import re
@@ -38,28 +39,43 @@ class TTSState:
 
 def source_text(extra: str) -> str:
     """Return stable speech text from Extra, excluding managed metadata."""
-    value = MANAGED_BLOCK_RE.sub("", extra or "")
-    value = MARKER_RE.sub("", value)
-    value = SOUND_RE.sub("", value)
-    value = IMG_RE.sub(" ", value)
-    value = html.unescape(value)
-    value = TAG_RE.sub(" ", value)
-    value = value.replace("\u00a0", " ")
+    if not extra:
+        return ""
+    value = extra
+    if "<!--" in value:
+        value = MANAGED_BLOCK_RE.sub("", value)
+        if "<!--" in value:
+            value = MARKER_RE.sub("", value)
+    if "[sound:" in value:
+        value = SOUND_RE.sub("", value)
+    if "<img" in value or "<IMG" in value:
+        value = IMG_RE.sub(" ", value)
+    if "&" in value:
+        value = html.unescape(value)
+    if "<" in value:
+        value = TAG_RE.sub(" ", value)
+    if "\u00a0" in value:
+        value = value.replace("\u00a0", " ")
     return SPACE_RE.sub(" ", value).strip()
 
 
+@functools.lru_cache(maxsize=4096)
 def digest_for(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+@functools.lru_cache(maxsize=4096)
 def generation_digest(source_digest: str, profile_digest: str) -> str:
     """Identify audio by both spoken content and synthesis configuration."""
     return digest_for(f"{source_digest}:{profile_digest}")
 
 
+@functools.lru_cache(maxsize=4096)
 def state_for(extra: str) -> TTSState:
+    if not extra:
+        return TTSState("", digest_for(""), None, None, None)
     text = source_text(extra)
-    managed = MANAGED_BLOCK_RE.search(extra or "")
+    managed = MANAGED_BLOCK_RE.search(extra) if "<!--" in extra else None
     marker_digest = (managed.group(2) or managed.group(1)).lower() if managed else None
     profile_digest = managed.group(3).lower() if managed and managed.group(3) else None
     sound_filename = None

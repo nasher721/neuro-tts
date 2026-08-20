@@ -170,11 +170,7 @@ load()
 # ── public API ──────────────────────────────────────────────────────────────
 def get(key: str, default: Any = None) -> Any:
     """Return *key* from the live config, falling back to DEFAULTS then *default*."""
-    if key in _cfg:
-        return _cfg[key]
-    if key in DEFAULTS:
-        return DEFAULTS[key]
-    return default
+    return _cfg.get(key, DEFAULTS.get(key, default))
 
 
 def get_speed() -> str:
@@ -189,13 +185,16 @@ def get_device() -> str:
 def get_ffmpeg_path() -> str | None:
     """Resolve ffmpeg: config → PATH → hard-coded candidates."""
     configured = _cfg.get("ffmpeg_path")
-    candidates = ([configured] if configured else []) + [shutil.which("ffmpeg")] + [
+    if configured and os.path.isfile(str(configured)) and os.access(configured, os.X_OK):
+        return str(configured)
+    candidates = (
+        shutil.which("ffmpeg"),
         "/opt/homebrew/bin/ffmpeg",
         "/usr/local/bin/ffmpeg",
         "/usr/bin/ffmpeg",
-    ]
+    )
     for candidate in candidates:
-        if candidate and Path(candidate).is_file() and os.access(candidate, os.X_OK):
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
             return str(candidate)
     return None
 

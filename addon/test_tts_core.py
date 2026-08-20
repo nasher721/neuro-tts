@@ -94,6 +94,18 @@ class TTSCoreTests(unittest.TestCase):
         self.assertIn("data-speed", extra)
         self.assertIn("neuroicu-wave", extra)
 
+    def test_state_for_handles_empty_and_cached_lookups(self):
+        empty_state = state_for("")
+        self.assertEqual(empty_state.text, "")
+        self.assertIsNone(empty_state.marker_digest)
+        self.assertIsNone(empty_state.sound_filename)
+
+        # Repeated calls should return the same cached instance
+        s1 = state_for("Repeated explanation text")
+        s2 = state_for("Repeated explanation text")
+        self.assertIs(s1, s2)
+        self.assertEqual(s1.digest, digest_for("Repeated explanation text"))
+
 
 if __name__ == "__main__":
     unittest.main()

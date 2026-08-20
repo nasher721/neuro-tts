@@ -442,7 +442,8 @@ if QDialog is not None:
 
         def _diagnostics_refresh_log(self) -> None:
             if self._on_log_tail:
-                self._raw_log_tail = self._on_log_tail()
+                self._raw_log_tail = self._on_log_tail() or ""
+                self._raw_log_lines = self._raw_log_tail.splitlines()
                 self._filter_log_display()
 
         def _filter_log_display(self) -> None:
@@ -452,7 +453,11 @@ if QDialog is not None:
             if not term:
                 self.log_tail.setPlainText(raw)
             else:
-                filtered = [line for line in raw.splitlines() if term in line.lower()]
+                lines = getattr(self, "_raw_log_lines", None)
+                if lines is None:
+                    lines = raw.splitlines()
+                    self._raw_log_lines = lines
+                filtered = [line for line in lines if term in line.lower()]
                 self.log_tail.setPlainText("\n".join(filtered))
 
         def _diagnostics_copy_log(self) -> None:

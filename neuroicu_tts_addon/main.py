@@ -111,29 +111,52 @@ class JobStore:
         path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(path, timeout=30)
         self.conn.execute("PRAGMA busy_timeout=30000")
-        self.conn.execute("CREATE TABLE IF NOT EXISTS jobs (job_id TEXT PRIMARY KEY, note_id INTEGER, source TEXT, digest TEXT, state TEXT, error TEXT, updated REAL)"); self.conn.commit()
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
+        self.conn.execute("PRAGMA cache_size=-2000")
+        self.conn.execute("CREATE TABLE IF NOT EXISTS jobs (job_id TEXT PRIMARY KEY, note_id INTEGER, source TEXT, digest TEXT, state TEXT, error TEXT, updated REAL)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_digest ON jobs(digest)")
+        self.conn.commit()
+
     def enqueue(self, j):
-        self.conn.execute("INSERT OR REPLACE INTO jobs VALUES (?, ?, ?, ?, 'queued', NULL, ?)", (j.job_id, j.note_id, j.source, j.digest, time.time())); self.conn.commit()
+        self.conn.execute("INSERT OR REPLACE INTO jobs VALUES (?, ?, ?, ?, 'queued', NULL, ?)", (j.job_id, j.note_id, j.source, j.digest, time.time()))
+        self.conn.commit()
+
+    def enqueue_many(self, jobs):
+        now = time.time()
+        data = [(j.job_id, j.note_id, j.source, j.digest, "queued", None, now) for j in jobs]
+        self.conn.executemany("INSERT OR REPLACE INTO jobs VALUES (?, ?, ?, ?, ?, ?, ?)", data)
+        self.conn.commit()
+
     def set_state(self, jid, state, error=None):
-        self.conn.execute("UPDATE jobs SET state=?, error=?, updated=? WHERE job_id=?", (state, error, time.time(), jid)); self.conn.commit()
-    def close(self): self.conn.close()
+        self.conn.execute("UPDATE jobs SET state=?, error=?, updated=? WHERE job_id=?", (state, error, time.time(), jid))
+        self.conn.commit()
+
+    def close(self):
+        self.conn.close()
+
     def recoverable(self):
         return self.conn.execute("SELECT note_id, source, digest FROM jobs WHERE state IN ('queued', 'running', 'staged', 'failed', 'failed_retryable')").fetchall()
 
     def recoverable_jobs(self):
         rows = self.conn.execute("SELECT job_id, note_id, source, digest FROM jobs WHERE state IN ('queued', 'running', 'staged', 'failed', 'failed_retryable')").fetchall()
-        self.conn.execute("UPDATE jobs SET state='queued', error=NULL, updated=? WHERE state IN ('running', 'staged', 'failed', 'failed_retryable')", (time.time(),))
-        self.conn.commit()
+        if rows:
+            self.conn.execute("UPDATE jobs SET state='queued', error=NULL, updated=? WHERE state IN ('running', 'staged', 'failed', 'failed_retryable')", (time.time(),))
+            self.conn.commit()
         return rows
+
     def counts_by_status(self):
         """G2 — job counts grouped by state for the read-only Queue tab."""
         rows = self.conn.execute("SELECT state, COUNT(*) FROM jobs GROUP BY state").fetchall()
         return {state: count for state, count in rows}
+
     def clear_finished(self):
         """G4 — remove terminal jobs; return the number of rows deleted."""
         cur = self.conn.execute("DELETE FROM jobs WHERE state IN ('succeeded', 'failed_terminal', 'stale')")
         self.conn.commit()
         return cur.rowcount
+
     def existing_digests(self):
         """G11 — all stored digests, for dedupe during full-deck enqueue."""
         rows = self.conn.execute("SELECT digest FROM jobs").fetchall()
@@ -156,7 +179,8 @@ def _run_process(args, *, timeout=_SUBPROCESS_TIMEOUT, cwd=None, cancel_event=No
                 process.kill(); process.communicate()
                 raise RuntimeError(f"command timed out after {timeout}s: {args[0]}")
             try:
-                stdout, stderr = process.communicate(timeout=min(0.2, remaining))
+                poll_timeout = min(0.2, remaining) if cancel_event is not None else remaining
+                stdout, stderr = process.communicate(timeout=poll_timeout)
                 break
             except subprocess.TimeoutExpired:
                 continue
@@ -283,31 +307,48 @@ def _media_dir(): return Path(mw.col.media.dir())
 
 
 def _managed_media_exists(sound_filename):
+    if not sound_filename:
+        return False
     try:
-        return bool(sound_filename and (_media_dir() / sound_filename).is_file())
+        media_path = str(_media_dir())
+        return os.path.isfile(os.path.join(media_path, str(sound_filename)))
     except (AttributeError, OSError, TypeError):
         return False
+
+
+_path_identity_cache: dict[str, tuple[int, int, dict]] = {}
 
 
 def _path_identity(path):
     if not path:
         return None
-    value = Path(path)
+    p_str = str(path)
     try:
-        resolved = value.resolve()
-        stat = resolved.stat()
-        identity = {"path": str(resolved), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+        resolved = str(Path(path).resolve())
+        stat_res = os.stat(resolved)
+        mtime = stat_res.st_mtime_ns
+        size = stat_res.st_size
     except OSError:
-        return {"path": str(value)}
-    if resolved.is_dir():
-        head = resolved / ".git" / "HEAD"
+        return {"path": p_str}
+
+    cached = _path_identity_cache.get(resolved)
+    if cached is not None and cached[0] == mtime and cached[1] == size:
+        return cached[2]
+
+    identity = {"path": resolved, "size": size, "mtime_ns": mtime}
+    if os.path.isdir(resolved):
+        head = os.path.join(resolved, ".git", "HEAD")
         try:
-            head_value = head.read_text(encoding="utf-8").strip()
+            with open(head, "r", encoding="utf-8") as f:
+                head_value = f.read().strip()
             identity["git_head"] = head_value
             if head_value.startswith("ref: "):
-                identity["git_revision"] = (resolved / ".git" / head_value[5:]).read_text(encoding="utf-8").strip()
+                ref_file = os.path.join(resolved, ".git", head_value[5:])
+                with open(ref_file, "r", encoding="utf-8") as f:
+                    identity["git_revision"] = f.read().strip()
         except OSError:
             pass
+    _path_identity_cache[resolved] = (mtime, size, identity)
     return identity
 
 
@@ -332,16 +373,46 @@ def _synthesis_profile_digest():
     }
     return digest_for(json.dumps(payload, sort_keys=True, separators=(",", ":")))
 
-def _eligible(note, ignore_pilot=False):
-    if note.model()["name"] != MODEL or not note["Extra"].strip(): return False
-    if not ignore_pilot and PILOT_ONLY and PILOT_TAG not in note.tags: return False
-    decks = {mw.col.decks.get(c.did)["name"] for c in note.cards()}
-    return any(n == DECK_PREFIX or n.startswith(DECK_PREFIX + "::") for n in decks)
 
-def _submit(note, force=False):
+def _is_deck_eligible(did):
+    try:
+        deck = mw.col.decks.get(did, default=False)
+        if not deck:
+            return False
+        name = deck.get("name", "") if isinstance(deck, dict) else getattr(deck, "name", "")
+        return name == DECK_PREFIX or name.startswith(DECK_PREFIX + "::")
+    except Exception:
+        return False
+
+
+def _eligible(note, ignore_pilot=False):
+    extra = note.get("Extra") if hasattr(note, "get") else (note["Extra"] if "Extra" in note else None)
+    if not extra or not str(extra).strip():
+        return False
+    try:
+        model = note.model()
+        model_name = model.get("name") if isinstance(model, dict) else getattr(model, "name", None)
+        if model_name != MODEL:
+            return False
+    except Exception:
+        return False
+    if not ignore_pilot and PILOT_ONLY and PILOT_TAG not in note.tags:
+        return False
+    try:
+        return any(_is_deck_eligible(c.did) for c in note.cards())
+    except Exception:
+        try:
+            decks = {mw.col.decks.get(c.did)["name"] for c in note.cards()}
+            return any(n == DECK_PREFIX or n.startswith(DECK_PREFIX + "::") for n in decks)
+        except Exception:
+            return False
+
+
+def _submit(note, force=False, profile_digest=None):
     if not _eligible(note): return False
     s = state_for(note["Extra"])
-    profile_digest = _synthesis_profile_digest()
+    if profile_digest is None:
+        profile_digest = _synthesis_profile_digest()
     artifact_digest = generation_digest(s.digest, profile_digest)
     expected = filename(note.id, artifact_digest)
     if not force and s.marker_digest == s.digest and getattr(s, "profile_digest", None) == profile_digest and s.sound_filename == expected and _managed_media_exists(expected):
@@ -357,6 +428,7 @@ def _submit(note, force=False):
     if not worker: return False
     return worker.submit(Job(str(uuid.uuid4()), note.id, s.text, artifact_digest, force))
 
+
 def upgrade_legacy_notes():
     """Upgrade notes using legacy [sound:...] managed tags to the click-to-play player."""
     if mw is None:
@@ -367,15 +439,16 @@ def upgrade_legacy_notes():
         for nid in mw.col.find_notes(f'note:"{MODEL}"'):
             try:
                 note = mw.col.get_note(nid)
-                if not note["Extra"].strip():
+                extra = note.get("Extra") if hasattr(note, "get") else (note["Extra"] if "Extra" in note else "")
+                if not extra or not str(extra).strip():
                     continue
-                if is_legacy_extra(note["Extra"]):
-                    s = state_for(note["Extra"])
+                if is_legacy_extra(extra):
+                    s = state_for(extra)
                     artifact_digest = generation_digest(s.digest, profile_digest)
                     expected = filename(note.id, artifact_digest)
                     if _managed_media_exists(expected) or _managed_media_exists(s.sound_filename):
                         actual_file = expected if _managed_media_exists(expected) else s.sound_filename
-                        note["Extra"] = managed_extra(note["Extra"], actual_file, s.digest, profile_digest)
+                        note["Extra"] = managed_extra(extra, actual_file, s.digest, profile_digest)
                         mw.col.update_note(note)
                         upgraded += 1
             except Exception:
@@ -386,6 +459,7 @@ def upgrade_legacy_notes():
     except Exception as exc:
         LOGGER.exception("Upgrade legacy notes scan failed: %s", exc)
     return upgraded
+
 
 def _commit(r: Result):
     global _last_generation_at, _last_event
@@ -409,7 +483,7 @@ def _commit(r: Result):
     if artifact_digest != r.job.digest:
         r.artifact.unlink(missing_ok=True)
         if worker: worker.mark_committed(r.job.job_id, False)
-        _submit(note)
+        _submit(note, profile_digest=profile_digest)
         _emit_status()
         return False
     expected = filename(note.id, artifact_digest)
@@ -431,11 +505,13 @@ def _commit(r: Result):
     _emit_status()
     return True
 
+
 def scan_collection():
     global _last_scan_at, _last_event
     try:
         upgrade_legacy_notes()
-        count = sum(_submit(mw.col.get_note(nid)) for nid in mw.col.find_notes(f'note:"{MODEL}"'))
+        profile_digest = _synthesis_profile_digest()
+        count = sum(_submit(mw.col.get_note(nid), profile_digest=profile_digest) for nid in mw.col.find_notes(f'note:"{MODEL}"'))
     except Exception as exc:
         _last_scan_at, _last_event = time.time(), f"Scan unavailable: {exc}"
         LOGGER.exception("Collection scan failed")
@@ -755,7 +831,16 @@ def _log_tail(lines=200):
 def _storage_size():
     """G4 — total bytes of add-on-managed audio in the collection media folder."""
     try:
-        return sum(path.stat().st_size for path in _media_dir().glob("neuroicu_tts_*.mp3") if path.is_file())
+        media_path = str(_media_dir())
+        if not os.path.isdir(media_path):
+            return 0
+        total = 0
+        with os.scandir(media_path) as entries:
+            for entry in entries:
+                name = entry.name
+                if name.startswith("neuroicu_tts_") and name.endswith(".mp3") and entry.is_file():
+                    total += entry.stat().st_size
+        return total
     except Exception as exc:
         LOGGER.warning("Storage size unavailable: %s", exc)
         return 0
@@ -821,7 +906,7 @@ def _full_deck_convert():
             artifact_digest = generation_digest(state.digest, profile_digest)
             if artifact_digest in digests:
                 continue  # G11.5 — already queued/stored for this exact content+profile
-            if _submit(note):
+            if _submit(note, profile_digest=profile_digest):
                 enqueued += 1
                 digests.add(artifact_digest)
         except Exception:

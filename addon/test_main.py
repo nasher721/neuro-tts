@@ -812,6 +812,19 @@ class ConfigCenterCallbackTests(unittest.TestCase):
         self.assertIn(".neuroicu-play-btn", evals[0])
         self.assertIn(".neuroicu-audio", evals[0])
 
+    def test_job_store_enqueue_many_batches_jobs(self):
+        self._fake_mw_with_profile()
+        store = main.JobStore(self.root / "neuroicu_tts.sqlite3")
+        jobs = [main.Job(f"batch-{i}", i, f"text {i}", f"digest-{i}") for i in range(10)]
+        store.enqueue_many(jobs)
+        counts = store.counts_by_status()
+        store.close()
+        self.assertEqual(counts, {"queued": 10})
+
+    def test_storage_size_handles_nonexistent_directory(self):
+        main.mw = SimpleNamespace(col=SimpleNamespace(media=SimpleNamespace(dir=lambda: str(self.root / "nonexistent"))))
+        self.assertEqual(main._storage_size(), 0)
+
 
 if __name__ == "__main__":
     unittest.main()
