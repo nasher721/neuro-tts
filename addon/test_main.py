@@ -748,6 +748,70 @@ class ConfigCenterCallbackTests(unittest.TestCase):
         main.mw = SimpleNamespace()
         self.assertEqual(main._full_deck_convert(), (0, 0))
 
+    # ── Click-to-play audio & legacy upgrade tests ────────────────────────────
+    def test_submit_instantly_upgrades_legacy_sound_tag_when_media_exists(self):
+        profile_digest = main.digest_for("voice-profile")
+        source_digest = main.digest_for("Sample explanation")
+        artifact_digest = main.generation_digest(source_digest, profile_digest)
+        fname = main.filename(101, artifact_digest)
+        legacy_extra = f"Sample explanation\n\n<!-- neuroicu-tts:v2:{source_digest}:{profile_digest} --> [sound:{fname}]"
+
+        class FakeNote(dict):
+            def __init__(self, nid, extra):
+                super().__init__(Extra=extra)
+                self.id = nid
+
+        note = FakeNote(101, legacy_extra)
+        updated_notes = []
+        col = SimpleNamespace(update_note=lambda n: updated_notes.append(dict(n)))
+        worker = SimpleNamespace(submit=unittest.mock.Mock(return_value=True))
+        main.mw = SimpleNamespace(col=col, _neuroicu_tts_worker=worker)
+
+        with patch.object(main, "_eligible", return_value=True), patch.object(main, "_synthesis_profile_digest", return_value=profile_digest), patch.object(main, "_managed_media_exists", return_value=True):
+            result = main._submit(note)
+
+        # Must not submit to worker because media exists and is up to date
+        self.assertFalse(result)
+        self.assertEqual(worker.submit.call_count, 0)
+        # Must have updated note to HTML player
+        self.assertEqual(len(updated_notes), 1)
+        self.assertIn('class="neuroicu-tts-player"', note["Extra"])
+        self.assertIn('class="neuroicu-audio"', note["Extra"])
+        self.assertNotIn("[sound:", note["Extra"])
+
+    def test_upgrade_legacy_notes_upgrades_collection(self):
+        profile_digest = main.digest_for("voice-profile")
+        source_digest = main.digest_for("Explanation text")
+        artifact_digest = main.generation_digest(source_digest, profile_digest)
+        fname = main.filename(202, artifact_digest)
+        legacy_extra = f"Explanation text\n\n<!-- neuroicu-tts:v2:{source_digest}:{profile_digest} --> [sound:{fname}]"
+
+        class FakeNote(dict):
+            def __init__(self, nid, extra):
+                super().__init__(Extra=extra)
+                self.id = nid
+
+        notes = {202: FakeNote(202, legacy_extra)}
+        col = SimpleNamespace(find_notes=lambda _q: [202], get_note=lambda nid: notes[nid], update_note=lambda n: None)
+        main.mw = SimpleNamespace(col=col)
+
+        with patch.object(main, "_synthesis_profile_digest", return_value=profile_digest), patch.object(main, "_managed_media_exists", return_value=True):
+            upgraded = main.upgrade_legacy_notes()
+
+        self.assertEqual(upgraded, 1)
+        self.assertIn('class="neuroicu-tts-player"', notes[202]["Extra"])
+        self.assertNotIn("[sound:", notes[202]["Extra"])
+
+    def test_replay_evaluates_js_to_toggle_audio(self):
+        evals = []
+        web = SimpleNamespace(eval=lambda script: evals.append(script))
+        reviewer = SimpleNamespace(web=web)
+        main.mw = SimpleNamespace(reviewer=reviewer)
+        main._replay()
+        self.assertEqual(len(evals), 1)
+        self.assertIn(".neuroicu-play-btn", evals[0])
+        self.assertIn(".neuroicu-audio", evals[0])
+
 
 if __name__ == "__main__":
     unittest.main()

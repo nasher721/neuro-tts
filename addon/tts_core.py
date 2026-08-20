@@ -17,8 +17,9 @@ MARKER_RE = re.compile(
 )
 SOUND_RE = re.compile(r"\[sound:([^\]]+)\]", re.I)
 MANAGED_BLOCK_RE = re.compile(
-    r"\s*<!--\s*neuroicu-tts:(?:v1:([0-9a-f]{64})|v2:([0-9a-f]{64}):([0-9a-f]{64}))\s*-->\s*(?:\[sound:([^\]]+)\])?",
-    re.I,
+    r"\s*<!--\s*neuroicu-tts:(?:v1:([0-9a-f]{64})|v2:([0-9a-f]{64}):([0-9a-f]{64}))\s*-->"
+    r"(?:\s*(?:\[sound:([^\]]+)\]|<div\b[^>]*\bclass=[\"']neuroicu-tts-player[\"'][^>]*>.*?<audio\b[^>]*\bsrc=[\"']([^\"']+)[\"'][^>]*>.*?</audio>.*?</div>))?",
+    re.I | re.DOTALL,
 )
 MANAGED_FILENAME_RE = re.compile(r"^neuroicu_tts_(\d+)-([0-9a-f]{64})\.mp3$", re.I)
 IMG_RE = re.compile(r"<img\b[^>]*>", re.I)
@@ -37,7 +38,8 @@ class TTSState:
 
 def source_text(extra: str) -> str:
     """Return stable speech text from Extra, excluding managed metadata."""
-    value = MARKER_RE.sub("", extra or "")
+    value = MANAGED_BLOCK_RE.sub("", extra or "")
+    value = MARKER_RE.sub("", value)
     value = SOUND_RE.sub("", value)
     value = IMG_RE.sub(" ", value)
     value = html.unescape(value)
@@ -60,18 +62,58 @@ def state_for(extra: str) -> TTSState:
     managed = MANAGED_BLOCK_RE.search(extra or "")
     marker_digest = (managed.group(2) or managed.group(1)).lower() if managed else None
     profile_digest = managed.group(3).lower() if managed and managed.group(3) else None
-    sound_filename = managed.group(4).strip() if managed and managed.group(4) else None
+    sound_filename = None
+    if managed:
+        raw_name = managed.group(5) or managed.group(4)
+        if raw_name:
+            sound_filename = raw_name.strip()
     return TTSState(text, digest_for(text), marker_digest, sound_filename, profile_digest)
 
 
-def managed_extra(extra: str, filename: str, digest: str, profile_digest: str | None = None) -> str:
+def is_legacy_extra(extra: str) -> bool:
+    """Return True if extra contains the legacy [sound:...] managed block instead of the click-to-play widget."""
+    if not extra:
+        return False
+    managed = MANAGED_BLOCK_RE.search(extra)
+    if not managed:
+        return False
+    return bool(managed.group(4))
+
+
+def player_html(filename: str) -> str:
+    """Return the accessible, responsive click-to-play HTML player widget with animated equalizer and speed switcher."""
+    return (
+        f'<div class="neuroicu-tts-player" style="margin-top: 10px; margin-bottom: 6px; display: inline-flex; align-items: center; gap: 8px; font-family: -apple-system, BlinkMacSystemFont, \'Segoe UI\', Roboto, Helvetica, Arial, sans-serif;">'
+        f'<audio class="neuroicu-audio" src="{filename}" preload="none" '
+        f'onended="var p=this.closest(\'.neuroicu-tts-player\'); if(p){{var b=p.querySelector(\'.neuroicu-play-btn\'); if(b){{b.classList.remove(\'playing\'); b.querySelector(\'.neuroicu-btn-label\').textContent=\'Play Explanation\'; var eq=p.querySelector(\'.neuroicu-eq\'); if(eq)eq.style.display=\'none\'; var ic=p.querySelector(\'.neuroicu-icon\'); if(ic)ic.textContent=\'&#9654;\';}}}}" '
+        f'onplay="var p=this.closest(\'.neuroicu-tts-player\'); if(p){{var b=p.querySelector(\'.neuroicu-play-btn\'); if(b){{b.classList.add(\'playing\'); b.querySelector(\'.neuroicu-btn-label\').textContent=\'Pause\'; var eq=p.querySelector(\'.neuroicu-eq\'); if(eq)eq.style.display=\'inline-flex\'; var ic=p.querySelector(\'.neuroicu-icon\'); if(ic)ic.textContent=\'&#9208;\';}}}}" '
+        f'onpause="var p=this.closest(\'.neuroicu-tts-player\'); if(p){{var b=p.querySelector(\'.neuroicu-play-btn\'); if(b){{b.classList.remove(\'playing\'); b.querySelector(\'.neuroicu-btn-label\').textContent=\'Play Explanation\'; var eq=p.querySelector(\'.neuroicu-eq\'); if(eq)eq.style.display=\'none\'; var ic=p.querySelector(\'.neuroicu-icon\'); if(ic)ic.textContent=\'&#9654;\';}}}}"></audio>'
+        f'<button type="button" class="neuroicu-play-btn" aria-label="Play Explanation Audio" onclick="var a=this.parentElement.querySelector(\'audio\'); if(!a)return false; if(a.paused){{a.play();}}else{{a.pause(); a.currentTime=0;}} return false;" style="cursor: pointer; padding: 7px 15px; border-radius: 20px; border: 1px solid rgba(59,130,246,0.35); background: rgba(59,130,246,0.14); color: inherit; font-size: 13px; font-weight: 600; display: inline-flex; align-items: center; gap: 7px; transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1); box-shadow: 0 1px 3px rgba(0,0,0,0.06); user-select: none; -webkit-user-select: none;">'
+        f'<span class="neuroicu-icon" style="font-size: 1.1em; line-height: 1;">&#9654;</span>'
+        f'<span class="neuroicu-btn-label">Play Explanation</span>'
+        f'<span class="neuroicu-eq" style="display: none; align-items: flex-end; gap: 2px; height: 12px; margin-left: 2px;">'
+        f'<span style="display: inline-block; width: 2px; height: 100%; background: currentColor; border-radius: 1px; animation: neuroicu-wave 0.8s ease-in-out infinite alternate;"></span>'
+        f'<span style="display: inline-block; width: 2px; height: 60%; background: currentColor; border-radius: 1px; animation: neuroicu-wave 0.8s ease-in-out infinite alternate 0.2s;"></span>'
+        f'<span style="display: inline-block; width: 2px; height: 80%; background: currentColor; border-radius: 1px; animation: neuroicu-wave 0.8s ease-in-out infinite alternate 0.4s;"></span>'
+        f'</span>'
+        f'</button>'
+        f'<button type="button" class="neuroicu-speed-btn" title="Change Playback Speed" aria-label="Change Playback Speed" onclick="var a=this.parentElement.querySelector(\'audio\'); if(!a)return false; var speeds=[1.0, 1.25, 1.5, 1.75, 2.0]; var cur=parseFloat(this.getAttribute(\'data-speed\')||\'1.0\'); var next=speeds[(speeds.indexOf(cur)+1)%speeds.length]; a.playbackRate=next; this.setAttribute(\'data-speed\', next); this.textContent=next+\'x\'; return false;" style="cursor: pointer; padding: 7px 11px; border-radius: 20px; border: 1px solid rgba(148,163,184,0.3); background: rgba(148,163,184,0.12); color: inherit; font-size: 12px; font-weight: 600; user-select: none; -webkit-user-select: none; transition: all 0.2s ease;">1.0x</button>'
+        f'<style>@keyframes neuroicu-wave {{ 0% {{ height: 25%; opacity: 0.6; }} 100% {{ height: 100%; opacity: 1; }} }} .neuroicu-play-btn:hover {{ background: rgba(59,130,246,0.25) !important; transform: translateY(-1px); }} .neuroicu-speed-btn:hover {{ background: rgba(148,163,184,0.22) !important; transform: translateY(-1px); }} .neuroicu-play-btn:active, .neuroicu-speed-btn:active {{ transform: translateY(0); }}</style>'
+        f'</div>'
+    )
+
+
+def managed_extra(extra: str, filename: str, digest: str, profile_digest: str | None = None, legacy_sound_tag: bool = False) -> str:
     """Replace only the add-on-owned marker/audio block.
 
     User-authored sound tags are deliberately preserved.
     """
     value = MANAGED_BLOCK_RE.sub("", extra or "").rstrip()
     marker = f"v2:{digest}:{profile_digest}" if profile_digest else f"v1:{digest}"
-    suffix = f"\n\n<!-- neuroicu-tts:{marker} --> [sound:{filename}]"
+    if legacy_sound_tag:
+        suffix = f"\n\n<!-- neuroicu-tts:{marker} --> [sound:{filename}]"
+    else:
+        suffix = f"\n\n<!-- neuroicu-tts:{marker} -->\n{player_html(filename)}"
     return value + suffix
 
 
@@ -80,18 +122,15 @@ def filename(note_id: int, digest: str) -> str:
 
 
 def needs_update(extra: str, profile_digest: str | None = None) -> bool:
-    """Return whether managed audio is absent or no longer matches the text.
-
-    The note id is intentionally not part of this decision: callers that only
-    have card content must not treat an otherwise valid managed filename as
-    stale merely because it belongs to a different note id.
-    """
+    """Return whether managed audio is absent, stale, or uses the legacy autoplay format."""
     state = state_for(extra)
     if not state.text:
         return False
     if state.marker_digest != state.digest or not state.sound_filename:
         return True
     if profile_digest is not None and state.profile_digest != profile_digest:
+        return True
+    if is_legacy_extra(extra):
         return True
     match = MANAGED_FILENAME_RE.fullmatch(state.sound_filename)
     if not match:

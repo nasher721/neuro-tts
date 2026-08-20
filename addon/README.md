@@ -45,20 +45,27 @@ Anki media.
   recovered on the next profile open.
 - `Tools → Neuro ICU TTS Control Center` provides status, pilot scope, and queue actions.
 - `Ctrl+Alt+T` opens the Control Center directly.
+- `Ctrl+Alt+V` toggles playback of the explanation audio in the reviewer.
+- `Ctrl+Alt+G` (or `Tools → Generate Neuro ICU TTS for Current Card`) generates audio for the active card immediately.
 - `Tools → Queue Neuro ICU TTS scan` runs an immediate scan.
 - Audio is staged outside Anki media, revalidated on the main thread, and then
   stored as `neuroicu_tts_<note-id>-<sha256>.mp3`.
 - The filename and v2 marker identify both source text and synthesis settings,
   so changing the voice/model configuration queues regeneration.
-- The `Extra` field gets one managed HTML comment and one add-on-owned `[sound:...]` tag;
-  unrelated user audio tags are preserved.
+- The `Extra` field gets one managed HTML comment and an accessible, responsive
+  `<div class="neuroicu-tts-player">` click-to-play HTML5 player widget.
+- Audio **never** autoplays on the front side of the card or upon answering; it
+  plays **only** when the user clicks the play button or uses the replay shortcut.
+- Media files in `<audio src="...">` are fully recognized by Anki media sync (AnkiWeb, AnkiMobile iOS, AnkiDroid Android).
+- Unrelated user audio tags (`[sound:...]`) and note HTML are strictly preserved.
 - F5-TTS and FFmpeg calls have time limits and bounded diagnostic output.
 - Closing or switching profiles cancels the active synthesis subprocess and
   leaves interrupted work retryable for the next profile open.
 - Failed generation or note commit leaves the existing note content intact and
   writes details to `neuroicu_tts.log`.
-- Ordinary generation never deletes existing media. Automated cleanup is not
-  part of this release.
+- Ordinary generation never deletes existing media.
+- The Maintenance tab includes an "Upgrade Legacy Markers" action to instantly
+  upgrade existing cards to click-to-play without re-running synthesis.
 
 ## Control Center
 

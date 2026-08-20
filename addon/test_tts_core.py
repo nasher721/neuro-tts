@@ -15,6 +15,18 @@ class TTSCoreTests(unittest.TestCase):
         extra = "Explanation [sound:user.mp3] <!-- neuroicu-tts:v1:" + "a" * 64 + " --> [sound:old.mp3]"
         digest = digest_for("Explanation")
         result = managed_extra(extra, filename(123, digest), digest)
+        self.assertEqual(result.count("[sound:"), 1)
+        self.assertIn("user.mp3", result)
+        self.assertNotIn("old.mp3", result)
+        self.assertIn(filename(123, digest), result)
+        self.assertIn('class="neuroicu-tts-player"', result)
+        self.assertIn('class="neuroicu-audio"', result)
+        self.assertIn('class="neuroicu-play-btn"', result)
+
+    def test_managed_extra_legacy_sound_tag_mode(self):
+        extra = "Explanation [sound:user.mp3] <!-- neuroicu-tts:v1:" + "a" * 64 + " --> [sound:old.mp3]"
+        digest = digest_for("Explanation")
+        result = managed_extra(extra, filename(123, digest), digest, legacy_sound_tag=True)
         self.assertEqual(result.count("[sound:"), 2)
         self.assertIn(filename(123, digest), result)
         self.assertIn("user.mp3", result)
@@ -42,13 +54,19 @@ class TTSCoreTests(unittest.TestCase):
         digest = digest_for("Explanation")
         result = managed_extra(extra, filename(123, digest), digest)
         self.assertEqual(result.count("neuroicu-tts:v1:"), 1)
-        self.assertEqual(result.count("[sound:"), 1)
+        self.assertEqual(result.count("[sound:"), 0)
         self.assertIn(filename(123, digest), result)
+        self.assertIn('class="neuroicu-tts-player"', result)
 
     def test_needs_update_accepts_any_note_id_for_matching_managed_audio(self):
         digest = digest_for("Explanation")
         extra = managed_extra("Explanation", filename(123, digest), digest)
         self.assertFalse(needs_update(extra))
+
+    def test_needs_update_flags_legacy_sound_tag_for_upgrade(self):
+        digest = digest_for("Explanation")
+        legacy_extra = managed_extra("Explanation", filename(123, digest), digest, legacy_sound_tag=True)
+        self.assertTrue(needs_update(legacy_extra))
 
     def test_v2_marker_tracks_source_and_synthesis_profile(self):
         source_digest = digest_for("Explanation")
@@ -67,6 +85,14 @@ class TTSCoreTests(unittest.TestCase):
         source_digest = digest_for("Explanation")
         extra = managed_extra("Explanation", filename(42, source_digest), source_digest)
         self.assertTrue(needs_update(extra, digest_for("voice-a")))
+
+    def test_player_html_includes_equalizer_and_speed_control(self):
+        digest = digest_for("Explanation")
+        extra = managed_extra("Explanation", filename(42, digest), digest)
+        self.assertIn('class="neuroicu-speed-btn"', extra)
+        self.assertIn('class="neuroicu-eq"', extra)
+        self.assertIn("data-speed", extra)
+        self.assertIn("neuroicu-wave", extra)
 
 
 if __name__ == "__main__":

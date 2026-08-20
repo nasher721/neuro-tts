@@ -7,7 +7,7 @@ from pathlib import Path
 
 from . import config
 from .control_center import ControlCenter, estimate_runtime
-from .tts_core import digest_for, filename, generation_digest, managed_extra, state_for
+from .tts_core import digest_for, filename, generation_digest, is_legacy_extra, managed_extra, state_for
 from .status import ActivitySnapshot, EngineSnapshot, QueueSnapshot, ScopeSnapshot, StatusService
 
 try:
@@ -205,7 +205,12 @@ def _tts_file(text: str, destination: Path, cancel_event=None):
         wav = wav_dir / "speech.wav"
         if not wav.exists(): raise RuntimeError("F5-TTS completed without producing a WAV")
         staged = Path(tmp) / "speech.mp3"
-        _run_process([ffmpeg, "-y", "-loglevel", "error", "-i", str(wav), "-codec:a", "libmp3lame", "-q:a", "4", str(staged)], timeout=120, cancel_event=cancel_event)
+        audio_filter = "silenceremove=start_periods=1:start_duration=0.05:start_threshold=-50dB:stop_periods=1:stop_duration=0.1:stop_threshold=-50dB,loudnorm=I=-16:TP=-1.5:LRA=11"
+        try:
+            _run_process([ffmpeg, "-y", "-loglevel", "error", "-i", str(wav), "-af", audio_filter, "-codec:a", "libmp3lame", "-q:a", "3", str(staged)], timeout=120, cancel_event=cancel_event)
+        except Exception:
+            LOGGER.warning("FFmpeg audio filter normalization failed, falling back to direct encoding")
+            _run_process([ffmpeg, "-y", "-loglevel", "error", "-i", str(wav), "-codec:a", "libmp3lame", "-q:a", "4", str(staged)], timeout=120, cancel_event=cancel_event)
         if not staged.exists() or staged.stat().st_size == 0: raise RuntimeError("ffmpeg completed without producing an MP3")
         destination.parent.mkdir(parents=True, exist_ok=True); os.replace(staged, destination)
 
@@ -339,10 +344,48 @@ def _submit(note, force=False):
     profile_digest = _synthesis_profile_digest()
     artifact_digest = generation_digest(s.digest, profile_digest)
     expected = filename(note.id, artifact_digest)
-    if not force and s.marker_digest == s.digest and getattr(s, "profile_digest", None) == profile_digest and s.sound_filename == expected and _managed_media_exists(expected): return False
+    if not force and s.marker_digest == s.digest and getattr(s, "profile_digest", None) == profile_digest and s.sound_filename == expected and _managed_media_exists(expected):
+        if is_legacy_extra(note["Extra"]):
+            try:
+                note["Extra"] = managed_extra(note["Extra"], expected, s.digest, profile_digest)
+                mw.col.update_note(note)
+                LOGGER.info("Upgraded note %s to click-to-play player", note.id)
+            except Exception:
+                LOGGER.exception("Could not upgrade note %s", note.id)
+        return False
     worker = getattr(mw, "_neuroicu_tts_worker", None)
     if not worker: return False
     return worker.submit(Job(str(uuid.uuid4()), note.id, s.text, artifact_digest, force))
+
+def upgrade_legacy_notes():
+    """Upgrade notes using legacy [sound:...] managed tags to the click-to-play player."""
+    if mw is None:
+        return 0
+    upgraded = 0
+    profile_digest = _synthesis_profile_digest()
+    try:
+        for nid in mw.col.find_notes(f'note:"{MODEL}"'):
+            try:
+                note = mw.col.get_note(nid)
+                if not note["Extra"].strip():
+                    continue
+                if is_legacy_extra(note["Extra"]):
+                    s = state_for(note["Extra"])
+                    artifact_digest = generation_digest(s.digest, profile_digest)
+                    expected = filename(note.id, artifact_digest)
+                    if _managed_media_exists(expected) or _managed_media_exists(s.sound_filename):
+                        actual_file = expected if _managed_media_exists(expected) else s.sound_filename
+                        note["Extra"] = managed_extra(note["Extra"], actual_file, s.digest, profile_digest)
+                        mw.col.update_note(note)
+                        upgraded += 1
+            except Exception:
+                LOGGER.exception("Failed upgrading note %s", nid)
+        if upgraded:
+            LOGGER.info("Upgraded %d note(s) to click-to-play player", upgraded)
+            _last_event_set(f"Upgraded {upgraded} note(s) to click-to-play player")
+    except Exception as exc:
+        LOGGER.exception("Upgrade legacy notes scan failed: %s", exc)
+    return upgraded
 
 def _commit(r: Result):
     global _last_generation_at, _last_event
@@ -391,6 +434,7 @@ def _commit(r: Result):
 def scan_collection():
     global _last_scan_at, _last_event
     try:
+        upgrade_legacy_notes()
         count = sum(_submit(mw.col.get_note(nid)) for nid in mw.col.find_notes(f'note:"{MODEL}"'))
     except Exception as exc:
         _last_scan_at, _last_event = time.time(), f"Scan unavailable: {exc}"
@@ -424,7 +468,21 @@ def _drain():
 
 def _replay():
     web = getattr(getattr(mw, "reviewer", None), "web", None)
-    if web: web.eval("document.querySelector('.replay-button')?.click()")
+    if web:
+        js = (
+            "(function() {"
+            "  var btn = document.querySelector('.neuroicu-play-btn');"
+            "  if (btn) { btn.click(); return; }"
+            "  var audio = document.querySelector('.neuroicu-audio');"
+            "  if (audio) {"
+            "    if (audio.paused) { audio.play(); } else { audio.pause(); audio.currentTime = 0; }"
+            "    return;"
+            "  }"
+            "  var fallback = document.querySelector('.replay-button');"
+            "  if (fallback) fallback.click();"
+            "})()"
+        )
+        web.eval(js)
 
 def _engine_snapshot():
     repo = Path(F5_TTS_REPO) if F5_TTS_REPO else None
@@ -813,6 +871,7 @@ def _show_center():
         on_toggle_pilot=_toggle_pilot,
         on_full_deck_info=_full_deck_info,
         on_full_deck_convert=_full_deck_convert,
+        on_upgrade_legacy=upgrade_legacy_notes,
     )
     mw._neuroicu_tts_dialog = d
     d.show()
@@ -913,6 +972,13 @@ def _shutdown_profile_runtime(*_):
             shortcut.deleteLater()
         except Exception: LOGGER.exception("Could not remove Neuro ICU TTS shortcut")
         mw._neuroicu_tts_shortcut = None
+    shortcut_gen = getattr(mw, "_neuroicu_tts_shortcut_gen", None)
+    if shortcut_gen is not None:
+        try:
+            shortcut_gen.setEnabled(False)
+            shortcut_gen.deleteLater()
+        except Exception: LOGGER.exception("Could not remove Neuro ICU TTS generate shortcut")
+        mw._neuroicu_tts_shortcut_gen = None
     mw._neuroicu_tts_initialized = worker_alive
 
 def _init_profile_runtime():
@@ -928,8 +994,10 @@ def _init_profile_runtime():
     mw._neuroicu_tts_worker = worker
     menu = QAction("Neuro ICU TTS Control Center", mw); menu.setShortcut(QKeySequence("Ctrl+Alt+T")); menu.triggered.connect(_show_center); mw.form.menuTools.addAction(menu)
     scan = QAction("Queue Neuro ICU TTS scan", mw); scan.triggered.connect(scan_collection); mw.form.menuTools.addAction(scan)
-    mw._neuroicu_tts_menu_actions = [menu, scan]
+    generate = QAction("Generate Neuro ICU TTS for Current Card", mw); generate.setShortcut(QKeySequence("Ctrl+Alt+G")); generate.triggered.connect(_queue_current); mw.form.menuTools.addAction(generate)
+    mw._neuroicu_tts_menu_actions = [menu, scan, generate]
     shortcut = QShortcut(QKeySequence("Ctrl+Alt+V"), mw); shortcut.activated.connect(_replay); mw._neuroicu_tts_shortcut = shortcut
+    shortcut_gen = QShortcut(QKeySequence("Ctrl+Alt+G"), mw); shortcut_gen.activated.connect(_queue_current); mw._neuroicu_tts_shortcut_gen = shortcut_gen
     timer = QTimer(mw); timer.timeout.connect(_drain); timer.start(250); mw._neuroicu_tts_timer = timer
     _register_runtime_hooks()
     mw._neuroicu_tts_initialized = True

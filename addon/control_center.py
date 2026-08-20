@@ -23,6 +23,7 @@ def estimate_runtime(note_count: int, per_note_seconds: float = DEFAULT_PER_NOTE
 
 try:  # Keep pure status/tests importable on machines without Anki or Qt.
     from aqt.qt import (
+        QApplication,
         QCheckBox,
         QComboBox,
         QDialog,
@@ -33,6 +34,7 @@ try:  # Keep pure status/tests importable on machines without Anki or Qt.
         QLabel,
         QLineEdit,
         QPlainTextEdit,
+        QProgressBar,
         QPushButton,
         QTabWidget,
         QTimer,
@@ -97,6 +99,7 @@ if QDialog is not None:
             on_toggle_pilot: Callable[[bool], bool] | None = None,
             on_full_deck_info: Callable[[], tuple] | None = None,
             on_full_deck_convert: Callable[[], tuple] | None = None,
+            on_upgrade_legacy: Callable[[], int] | None = None,
         ) -> None:
             super().__init__(parent)
             self._status_service = status_service
@@ -115,6 +118,7 @@ if QDialog is not None:
             self._on_toggle_pilot = on_toggle_pilot
             self._on_full_deck_info = on_full_deck_info
             self._on_full_deck_convert = on_full_deck_convert
+            self._on_upgrade_legacy = on_upgrade_legacy
             self._pilot_tag = pilot_tag
             self._closed = False
             self._recommended_action = ""
@@ -371,6 +375,11 @@ if QDialog is not None:
             tab = QWidget()
             tab.setAccessibleName("Queue tab")
             layout = QVBoxLayout(tab)
+            self.queue_progress = QProgressBar()
+            self.queue_progress.setAccessibleName("Queue progress bar")
+            self.queue_progress.setRange(0, 100)
+            self.queue_progress.setValue(0)
+            layout.addWidget(self.queue_progress)
             self.queue_counts_label = QLabel()
             self.queue_counts_label.setWordWrap(True)
             self.queue_counts_label.setAccessibleName("Queue counts by status")
@@ -386,24 +395,45 @@ if QDialog is not None:
             counts = self._on_queue_counts() if self._on_queue_counts else {}
             lines = [f"{state}: {counts.get(state, 0)}" for state in self._QUEUE_STATES]
             self.queue_counts_label.setText("\n".join(lines))
+            total = sum(counts.get(s, 0) for s in self._QUEUE_STATES)
+            done = counts.get("succeeded", 0) + counts.get("failed_terminal", 0) + counts.get("stale", 0)
+            if total > 0:
+                pct = int((done / total) * 100)
+                self.queue_progress.setValue(pct)
+                self.queue_progress.setFormat(f"{done}/{total} jobs completed ({pct}%)")
+            else:
+                self.queue_progress.setValue(100)
+                self.queue_progress.setFormat("Queue idle (0 pending)")
 
         # ── Diagnostics tab (G3, read-only) ─────────────────────────────────
         def _build_diagnostics_tab(self) -> QWidget:
             tab = QWidget()
             tab.setAccessibleName("Diagnostics tab")
             layout = QVBoxLayout(tab)
-            test = QPushButton("Engine Test")
+            self._raw_log_tail = ""
+            btn_row = QHBoxLayout()
+            test = QPushButton("Run Engine Test")
             test.setAccessibleName("Run engine test")
             test.clicked.connect(self._engine_test_clicked)
-            layout.addWidget(test)
+            btn_row.addWidget(test)
+            refresh = QPushButton("Refresh Log")
+            refresh.setAccessibleName("Refresh log tail")
+            refresh.clicked.connect(self._diagnostics_refresh_log)
+            btn_row.addWidget(refresh)
+            copy_btn = QPushButton("Copy Log")
+            copy_btn.setAccessibleName("Copy log tail")
+            copy_btn.clicked.connect(self._diagnostics_copy_log)
+            btn_row.addWidget(copy_btn)
+            layout.addLayout(btn_row)
+            self.log_filter = QLineEdit()
+            self.log_filter.setPlaceholderText("Search / filter log lines...")
+            self.log_filter.setAccessibleName("Log filter")
+            self.log_filter.textChanged.connect(self._filter_log_display)
+            layout.addWidget(self.log_filter)
             self.log_tail = QPlainTextEdit()
             self.log_tail.setReadOnly(True)
             self.log_tail.setAccessibleName("Add-on log tail")
             layout.addWidget(self.log_tail)
-            refresh = QPushButton("Refresh log")
-            refresh.setAccessibleName("Refresh log tail")
-            refresh.clicked.connect(self._diagnostics_refresh_log)
-            layout.addWidget(refresh)
             return tab
 
         def _engine_test_clicked(self) -> None:
@@ -412,7 +442,27 @@ if QDialog is not None:
 
         def _diagnostics_refresh_log(self) -> None:
             if self._on_log_tail:
-                self.log_tail.setPlainText(self._on_log_tail())
+                self._raw_log_tail = self._on_log_tail()
+                self._filter_log_display()
+
+        def _filter_log_display(self) -> None:
+            query = getattr(self, "log_filter", None)
+            term = query.text().strip().lower() if query else ""
+            raw = getattr(self, "_raw_log_tail", "")
+            if not term:
+                self.log_tail.setPlainText(raw)
+            else:
+                filtered = [line for line in raw.splitlines() if term in line.lower()]
+                self.log_tail.setPlainText("\n".join(filtered))
+
+        def _diagnostics_copy_log(self) -> None:
+            text = self.log_tail.toPlainText()
+            try:
+                clip = QApplication.clipboard()
+                if clip is not None:
+                    clip.setText(text)
+            except Exception:
+                pass
 
         # ── Maintenance tab (G4, light) ─────────────────────────────────────
         def _build_maintenance_tab(self) -> QWidget:
@@ -433,8 +483,13 @@ if QDialog is not None:
             clear = QPushButton("Clear Finished")
             clear.setAccessibleName("Clear finished jobs")
             clear.clicked.connect(self._clear_finished_clicked)
+            upgrade = QPushButton("Upgrade Legacy Markers")
+            upgrade.setAccessibleName("Upgrade legacy audio markers to click-to-play")
+            upgrade.setToolTip("Upgrade existing notes using [sound:...] to the click-to-play HTML player without re-generating audio.")
+            upgrade.clicked.connect(self._upgrade_legacy_clicked)
             row.addWidget(refresh)
             row.addWidget(clear)
+            row.addWidget(upgrade)
             layout.addLayout(row)
             layout.addStretch(1)
             return tab
@@ -467,6 +522,19 @@ if QDialog is not None:
             if "removed" in outcome:
                 self.maintenance_status.setText(f"Cleared {outcome['removed']} finished job(s).")
                 self._queue_refresh()
+
+        def _upgrade_legacy_clicked(self) -> None:
+            if not self._on_upgrade_legacy:
+                return
+            outcome: dict = {}
+
+            def invoke() -> bool:
+                outcome["upgraded"] = self._on_upgrade_legacy()
+                return True
+
+            self._run_callback(invoke, "", "Upgrade legacy markers")
+            if "upgraded" in outcome:
+                self.maintenance_status.setText(f"Upgraded {outcome['upgraded']} note(s) to click-to-play player.")
 
         # ── Scope tab (G5 + G11) ────────────────────────────────────────────
         def _build_scope_tab(self) -> QWidget:
@@ -592,12 +660,21 @@ if QDialog is not None:
 
         def _render_cards(self, view: OverviewViewModel) -> None:
             self._clear_cards()
+            state_colors = {
+                "ready": "#10b981",
+                "setup": "#6366f1",
+                "degraded": "#f59e0b",
+                "unvalidated": "#f59e0b",
+                "active": "#3b82f6",
+                "idle": "#64748b",
+            }
             for index, card in enumerate(view.cards):
                 box = QGroupBox(card.title)
                 box.setAccessibleName(f"{card.title} status card")
                 box_layout = QVBoxLayout(box)
                 value = QLabel(card.value)
-                value.setStyleSheet("font-size: 18px; font-weight: bold;")
+                color = state_colors.get(card.state, "#2563eb")
+                value.setStyleSheet(f"font-size: 18px; font-weight: bold; color: {color};")
                 value.setAccessibleName(f"{card.title} value")
                 detail = QLabel(card.detail)
                 detail.setWordWrap(True)
