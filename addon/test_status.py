@@ -104,7 +104,9 @@ class StatusFixturesTests(unittest.TestCase):
         service = StatusService(
             lambda: EngineSnapshot(), lambda: ScopeSnapshot(), lambda: QueueSnapshot()
         )
-        listener = lambda snapshot: events.append(snapshot)
+        def listener(snapshot):
+            events.append(snapshot)
+
         service.subscribe(listener)
         service.subscribe(listener)
         service.notify()

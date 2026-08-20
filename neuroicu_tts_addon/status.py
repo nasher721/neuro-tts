@@ -9,7 +9,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Callable, Mapping
+from typing import Callable
+from collections.abc import Mapping
 
 
 @dataclass(frozen=True)
@@ -148,7 +149,7 @@ class OverviewViewModel:
     advanced_details: str | None = None
 
     @classmethod
-    def from_snapshot(cls, snapshot: StatusSnapshot) -> "OverviewViewModel":
+    def from_snapshot(cls, snapshot: StatusSnapshot) -> OverviewViewModel:
         engine = snapshot.engine
         if not engine.configured:
             banner = Banner(

@@ -1,5 +1,4 @@
 import sqlite3
-import subprocess
 import sys
 import tempfile
 import threading
@@ -15,6 +14,15 @@ try:
     from . import main
 except ImportError:  # Supports PYTHONPATH=addon unittest discovery.
     from addon import main
+
+
+def _no_retries():
+    """Force max_attempts=1 so a failure surfaces immediately instead of retrying."""
+    return patch.object(
+        main.config,
+        "get_int",
+        side_effect=lambda key: 1 if key == "max_attempts" else main.config.DEFAULTS[key],
+    )
 
 
 class WorkerAndEngineTests(unittest.TestCase):
@@ -153,13 +161,12 @@ class WorkerAndEngineTests(unittest.TestCase):
         self.assertEqual((first_device, second_device), ("mps", "cpu"))
 
     def test_non_mps_failure_is_not_retried(self):
-        with patch.object(main.config, "get_device", return_value="mps"), patch.object(main, "_run_process", side_effect=RuntimeError("command failed with exit 2")) as run_process:
-            with self.assertRaisesRegex(RuntimeError, "exit 2"):
-                main._run_f5_inference("hello", Path("/tmp/wav"))
+        with patch.object(main.config, "get_device", return_value="mps"), patch.object(main, "_run_process", side_effect=RuntimeError("command failed with exit 2")) as run_process, self.assertRaisesRegex(RuntimeError, "exit 2"):
+            main._run_f5_inference("hello", Path("/tmp/wav"))
         run_process.assert_called_once()
 
     def test_ffmpeg_resolves_homebrew_path_when_gui_path_is_missing(self):
-        with patch.object(main.shutil, "which", return_value=None), patch.object(main.Path, "is_file", return_value=True), patch.object(main.os, "access", return_value=True):
+        with patch.object(main.config.shutil, "which", return_value=None), patch.object(main.config.os.path, "isfile", return_value=True), patch.object(main.config.os, "access", return_value=True):
             self.assertEqual(main._ffmpeg_path(), "/opt/homebrew/bin/ffmpeg")
 
     def test_profile_shutdown_is_idempotent_and_clears_runtime(self):
@@ -312,7 +319,8 @@ class WorkerAndEngineTests(unittest.TestCase):
             }
             patches = [patch.object(main, name, value) for name, value in values.items()]
             patches.append(patch.object(main.config, "get_device", return_value="cpu"))
-            patches.append(patch.object(main.shutil, "which", return_value="/usr/bin/ffmpeg"))
+            patches.append(patch.object(main.shutil, "which", return_value=sys.executable))
+            patches.append(patch.object(main.config, "get_ffmpeg_path", return_value="/usr/bin/ffmpeg"))
             with ExitStack() as stack:
                 stack.enter_context(patch.object(main, "_tts_file", side_effect=fake_tts))
                 for item in patches:
@@ -506,7 +514,7 @@ class WorkerAndEngineTests(unittest.TestCase):
                 destination.write_bytes(b"mp3")
 
             worker = main.TTSWorker(root / "jobs.sqlite3", root / "media", results)
-            with patch.object(main, "_tts_file", side_effect=fake_tts):
+            with patch.object(main, "_tts_file", side_effect=fake_tts), _no_retries():
                 worker.start()
                 first = main.Job("failed", 1, "hello", "b" * 64)
                 second = main.Job("succeeded", 2, "hello", "c" * 64)

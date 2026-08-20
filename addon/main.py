@@ -1,14 +1,15 @@
 """Neuro ICU TTS add-on with an asynchronous F5-TTS queue."""
 from __future__ import annotations
 
-import json, logging, os, queue, shutil, sqlite3, subprocess, tempfile, threading, time, uuid
+import heapq, json, logging, logging.handlers, os, queue, shutil, sqlite3, subprocess, tempfile, threading, time, uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import config
 from .control_center import ControlCenter, estimate_runtime
-from .tts_core import digest_for, filename, generation_digest, is_legacy_extra, managed_extra, state_for
+from .tts_core import digest_for, filename, generation_digest, is_legacy_extra, is_managed_filename, managed_extra, state_for
 from .status import ActivitySnapshot, EngineSnapshot, QueueSnapshot, ScopeSnapshot, StatusService
+from .text_normalize import normalize_for_speech, split_for_synthesis
 
 try:
     from aqt import gui_hooks, mw
@@ -22,15 +23,53 @@ DECK_PREFIX = "Neuro ICU Boards (AnkiHub)"
 CONFIG_DIR = Path(__file__).resolve().parent
 LOGGER = logging.getLogger("neuroicu_tts")
 
-# Engine-locked settings are captured once at import; safe knobs (f5_speed,
-# f5_device, ffmpeg_path) are re-read from addon.config at point of use so
-# Config Center saves reach the worker at the next job start.
-F5_TTS_REPO = os.environ.get("F5_TTS_REPO", config.get("f5_tts_repo", ""))
-F5_TTS_PYTHON = os.environ.get("F5_TTS_PYTHON", config.get("f5_tts_python", "python3"))
-F5_MODEL, F5_REF_AUDIO = config.get("f5_model"), config.get("f5_ref_audio")
-F5_REF_TEXT = config.get("f5_ref_text")
-F5_NFE_STEP = str(config.get("f5_nfe_step"))
-PILOT_ONLY, PILOT_TAG = bool(config.get("pilot_only", True)), config.get("pilot_tag", "neuroicu-tts-pilot")
+# Engine settings mirror addon.config into module globals so that the worker
+# reads them without touching the config lock on every job.  They are refreshed
+# by _refresh_engine_globals() whenever the Control Center saves or reloads, so
+# editing engine paths no longer requires restarting Anki.  Environment
+# variables still win, which keeps machine-local paths out of config.json.
+F5_TTS_REPO = ""
+F5_TTS_PYTHON = "python3"
+F5_MODEL = ""
+F5_REF_AUDIO = ""
+F5_REF_TEXT = ""
+F5_NFE_STEP = "16"
+PILOT_ONLY, PILOT_TAG = True, "neuroicu-tts-pilot"
+
+
+# Scope counting walks the whole collection, and status is re-emitted on every
+# queue transition, so the result is cached and invalidated explicitly rather
+# than recomputed per event.
+SCOPE_CACHE_SECONDS = 30.0
+_scope_cache: tuple[float, ScopeSnapshot] | None = None
+_scope_cache_lock = threading.Lock()
+_deck_eligibility: dict[int, bool] = {}
+
+
+def _invalidate_scope_cache():
+    """Drop cached scope counts after anything that can change eligibility."""
+    global _scope_cache
+    with _scope_cache_lock:
+        _scope_cache = None
+    _deck_eligibility.clear()
+
+
+def _refresh_engine_globals():
+    """Re-read engine settings from addon.config (environment overrides win)."""
+    global F5_TTS_REPO, F5_TTS_PYTHON, F5_MODEL, F5_REF_AUDIO, F5_REF_TEXT, F5_NFE_STEP
+    global PILOT_ONLY, PILOT_TAG
+    F5_TTS_REPO = os.environ.get("F5_TTS_REPO", config.get("f5_tts_repo", "")) or ""
+    F5_TTS_PYTHON = os.environ.get("F5_TTS_PYTHON", config.get("f5_tts_python", "python3"))
+    F5_MODEL = config.get("f5_model") or ""
+    F5_REF_AUDIO = config.get("f5_ref_audio") or ""
+    F5_REF_TEXT = config.get("f5_ref_text") or ""
+    F5_NFE_STEP = str(config.get("f5_nfe_step"))
+    PILOT_ONLY = bool(config.get("pilot_only", True))
+    PILOT_TAG = config.get("pilot_tag", "neuroicu-tts-pilot")
+    _invalidate_scope_cache()
+
+
+_refresh_engine_globals()
 _last_scan_at = None
 _last_generation_at = None
 _last_event = None
@@ -76,14 +115,35 @@ def _engine_session_snapshot() -> EngineSession:
             checks=dict(session.checks),
         )
 
+LOG_MAX_BYTES = 2 * 1024 * 1024
+LOG_BACKUP_COUNT = 3
+
+
 def _configure_logging():
+    """Attach a size-capped rotating file handler exactly once per process."""
     with _logging_lock:
-        if LOGGER.handlers: return
-        try: h = logging.FileHandler(CONFIG_DIR / "neuroicu_tts.log", encoding="utf-8")
+        if LOGGER.handlers:
+            _apply_log_level()
+            return
+        try:
+            handler = logging.handlers.RotatingFileHandler(
+                CONFIG_DIR / "neuroicu_tts.log",
+                maxBytes=LOG_MAX_BYTES,
+                backupCount=LOG_BACKUP_COUNT,
+                encoding="utf-8",
+            )
         except OSError:
             LOGGER.warning("Could not create Neuro ICU TTS log file", exc_info=True)
             return
-        h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s")); LOGGER.addHandler(h); LOGGER.setLevel(logging.INFO)
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [%(threadName)s] %(message)s"))
+        LOGGER.addHandler(handler)
+        _apply_log_level()
+
+
+def _apply_log_level():
+    """Honour the configured log_level; unknown values fall back to INFO."""
+    level = logging.getLevelName(str(config.get("log_level", "INFO")).upper())
+    LOGGER.setLevel(level if isinstance(level, int) else logging.INFO)
 
 @dataclass(frozen=True)
 class Job:
@@ -97,6 +157,15 @@ class Result:
 @dataclass(frozen=True)
 class RecoveredJob:
     job: Job
+
+
+class _Wake:
+    """Sentinel that releases a blocking queue read without carrying work."""
+
+    __slots__ = ()
+
+
+_WAKE = _Wake()
 
 
 @dataclass(frozen=True)
@@ -115,23 +184,65 @@ class JobStore:
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.execute("PRAGMA cache_size=-2000")
         self.conn.execute("CREATE TABLE IF NOT EXISTS jobs (job_id TEXT PRIMARY KEY, note_id INTEGER, source TEXT, digest TEXT, state TEXT, error TEXT, updated REAL)")
+        self._migrate_schema()
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_digest ON jobs(digest)")
         self.conn.commit()
 
+    def _migrate_schema(self):
+        """Add columns introduced after the original schema, in place."""
+        existing = {row[1] for row in self.conn.execute("PRAGMA table_info(jobs)")}
+        if "attempts" not in existing:
+            self.conn.execute("ALTER TABLE jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
+
     def enqueue(self, j):
-        self.conn.execute("INSERT OR REPLACE INTO jobs VALUES (?, ?, ?, ?, 'queued', NULL, ?)", (j.job_id, j.note_id, j.source, j.digest, time.time()))
+        self.conn.execute(
+            "INSERT INTO jobs (job_id, note_id, source, digest, state, error, updated, attempts)"
+            " VALUES (?, ?, ?, ?, 'queued', NULL, ?, 0)"
+            " ON CONFLICT(job_id) DO UPDATE SET state='queued', error=NULL, updated=excluded.updated",
+            (j.job_id, j.note_id, j.source, j.digest, time.time()),
+        )
         self.conn.commit()
 
     def enqueue_many(self, jobs):
         now = time.time()
-        data = [(j.job_id, j.note_id, j.source, j.digest, "queued", None, now) for j in jobs]
-        self.conn.executemany("INSERT OR REPLACE INTO jobs VALUES (?, ?, ?, ?, ?, ?, ?)", data)
+        data = [(j.job_id, j.note_id, j.source, j.digest, "queued", None, now, 0) for j in jobs]
+        self.conn.executemany("INSERT OR REPLACE INTO jobs VALUES (?, ?, ?, ?, ?, ?, ?, ?)", data)
         self.conn.commit()
 
     def set_state(self, jid, state, error=None):
         self.conn.execute("UPDATE jobs SET state=?, error=?, updated=? WHERE job_id=?", (state, error, time.time(), jid))
         self.conn.commit()
+
+    def record_attempt(self, jid):
+        """Increment and return the attempt count for *jid*."""
+        self.conn.execute("UPDATE jobs SET attempts = attempts + 1, updated=? WHERE job_id=?", (time.time(), jid))
+        self.conn.commit()
+        row = self.conn.execute("SELECT attempts FROM jobs WHERE job_id=?", (jid,)).fetchone()
+        return int(row[0]) if row else 1
+
+    def retryable_jobs(self):
+        """Failed jobs the user asked to run again, reset to a fresh attempt count."""
+        rows = self.conn.execute(
+            "SELECT job_id, note_id, source, digest FROM jobs WHERE state IN ('failed_terminal', 'failed_retryable', 'cancelled')"
+        ).fetchall()
+        if rows:
+            self.conn.execute(
+                "UPDATE jobs SET state='queued', error=NULL, attempts=0, updated=?"
+                " WHERE state IN ('failed_terminal', 'failed_retryable', 'cancelled')",
+                (time.time(),),
+            )
+            self.conn.commit()
+        return rows
+
+    def cancel_pending(self):
+        """Mark every not-yet-finished job cancelled; return how many changed."""
+        cur = self.conn.execute(
+            "UPDATE jobs SET state='cancelled', updated=? WHERE state IN ('queued', 'running', 'staged')",
+            (time.time(),),
+        )
+        self.conn.commit()
+        return cur.rowcount
 
     def close(self):
         self.conn.close()
@@ -149,17 +260,17 @@ class JobStore:
     def counts_by_status(self):
         """G2 — job counts grouped by state for the read-only Queue tab."""
         rows = self.conn.execute("SELECT state, COUNT(*) FROM jobs GROUP BY state").fetchall()
-        return {state: count for state, count in rows}
+        return dict(rows)
 
     def clear_finished(self):
         """G4 — remove terminal jobs; return the number of rows deleted."""
-        cur = self.conn.execute("DELETE FROM jobs WHERE state IN ('succeeded', 'failed_terminal', 'stale')")
+        cur = self.conn.execute("DELETE FROM jobs WHERE state IN ('succeeded', 'failed_terminal', 'stale', 'cancelled')")
         self.conn.commit()
         return cur.rowcount
 
     def existing_digests(self):
         """G11 — all stored digests, for dedupe during full-deck enqueue."""
-        rows = self.conn.execute("SELECT digest FROM jobs").fetchall()
+        rows = self.conn.execute("SELECT digest FROM jobs WHERE state != 'cancelled'").fetchall()
         return {row[0] for row in rows}
 
 def _run_process(args, *, timeout=_SUBPROCESS_TIMEOUT, cwd=None, cancel_event=None):
@@ -202,10 +313,10 @@ def _ffmpeg_path() -> str | None:
     return config.get_ffmpeg_path()
 
 
-def _run_f5_inference(text: str, wav_dir: Path, cancel_event=None):
+def _run_f5_inference(text: str, wav_dir: Path, cancel_event=None, output_file: str = "speech.wav"):
     # Safe knobs are re-read per job so Config Center saves apply at next job start.
     device, speed = config.get_device(), config.get_speed()
-    args = [F5_TTS_PYTHON, str(Path(F5_TTS_REPO) / "src" / "f5_tts" / "infer" / "infer_cli.py"), "--model", F5_MODEL, "--ref_audio", str(Path(F5_REF_AUDIO) if Path(F5_REF_AUDIO).is_absolute() else Path(F5_TTS_REPO) / F5_REF_AUDIO), "--ref_text", F5_REF_TEXT, "--gen_text", text, "--output_dir", str(wav_dir), "--output_file", "speech.wav", "--device", device, "--nfe_step", F5_NFE_STEP, "--speed", speed]
+    args = [F5_TTS_PYTHON, str(Path(F5_TTS_REPO) / "src" / "f5_tts" / "infer" / "infer_cli.py"), "--model", F5_MODEL, "--ref_audio", str(Path(F5_REF_AUDIO) if Path(F5_REF_AUDIO).is_absolute() else Path(F5_TTS_REPO) / F5_REF_AUDIO), "--ref_text", F5_REF_TEXT, "--gen_text", text, "--output_dir", str(wav_dir), "--output_file", output_file, "--device", device, "--nfe_step", F5_NFE_STEP, "--speed", speed]
     try:
         _run_process(args, cwd=F5_TTS_REPO, cancel_event=cancel_event)
     except RuntimeError as exc:
@@ -216,6 +327,54 @@ def _run_f5_inference(text: str, wav_dir: Path, cancel_event=None):
         _run_process(args, cwd=F5_TTS_REPO, cancel_event=cancel_event)
 
 
+def speech_text(text: str) -> str:
+    """Apply the configured speech normalization to raw note text."""
+    if not config.get_bool("normalize_speech"):
+        return text
+    return normalize_for_speech(
+        text,
+        expand_abbreviations=config.get_bool("expand_abbreviations"),
+        extra_replacements=config.get_speech_replacements(),
+    ) or text
+
+
+def _synthesize_chunks(text: str, wav_dir: Path, ffmpeg: str, cancel_event=None) -> Path:
+    """Render *text* to a single WAV, splitting long input into joined chunks.
+
+    F5-TTS degrades badly on very long single utterances, so anything over
+    ``max_chunk_chars`` is synthesized in sentence-aligned pieces and stitched
+    back together with ffmpeg's concat demuxer.
+    """
+    chunks = split_for_synthesis(text, config.get_int("max_chunk_chars"))
+    if len(chunks) <= 1:
+        _run_f5_inference(chunks[0] if chunks else text, wav_dir, cancel_event)
+        return wav_dir / "speech.wav"
+
+    LOGGER.info("Synthesizing %d chunks for a %d character note", len(chunks), len(text))
+    parts = []
+    for index, chunk in enumerate(chunks):
+        name = f"part-{index:03d}.wav"
+        _run_f5_inference(chunk, wav_dir, cancel_event, output_file=name)
+        part = wav_dir / name
+        if not part.exists():
+            raise RuntimeError(f"F5-TTS produced no audio for chunk {index + 1} of {len(chunks)}")
+        parts.append(part)
+
+    listing = wav_dir / "parts.txt"
+    # The concat demuxer reads single-quoted paths with embedded quotes escaped.
+    listing.write_text(
+        "\n".join("file '{}'".format(str(part).replace("'", "'\\''")) for part in parts) + "\n",
+        encoding="utf-8",
+    )
+    joined = wav_dir / "speech.wav"
+    _run_process(
+        [ffmpeg, "-y", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", str(listing), "-c", "copy", str(joined)],
+        timeout=300,
+        cancel_event=cancel_event,
+    )
+    return joined
+
+
 def _tts_file(text: str, destination: Path, cancel_event=None):
     if not F5_TTS_REPO: raise RuntimeError("Set f5_tts_repo in config.json")
     cli = Path(F5_TTS_REPO) / "src" / "f5_tts" / "infer" / "infer_cli.py"
@@ -223,10 +382,12 @@ def _tts_file(text: str, destination: Path, cancel_event=None):
     ffmpeg = _ffmpeg_path()
     if not cli.exists() or not ref.exists(): raise RuntimeError("F5-TTS CLI or reference audio is missing")
     if not ffmpeg: raise RuntimeError("ffmpeg is required to convert F5-TTS WAV output to MP3")
+    spoken = speech_text(text)
+    if not spoken.strip():
+        raise RuntimeError("There is nothing speakable in this note after normalization")
     with tempfile.TemporaryDirectory(prefix="neuroicu-tts-") as tmp:
         wav_dir = Path(tmp) / "wav"; wav_dir.mkdir()
-        _run_f5_inference(text, wav_dir, cancel_event)
-        wav = wav_dir / "speech.wav"
+        wav = _synthesize_chunks(spoken, wav_dir, ffmpeg, cancel_event)
         if not wav.exists(): raise RuntimeError("F5-TTS completed without producing a WAV")
         staged = Path(tmp) / "speech.mp3"
         audio_filter = "silenceremove=start_periods=1:start_duration=0.05:start_threshold=-50dB:stop_periods=1:stop_duration=0.1:stop_threshold=-50dB,loudnorm=I=-16:TP=-1.5:LRA=11"
@@ -239,8 +400,43 @@ def _tts_file(text: str, destination: Path, cancel_event=None):
         destination.parent.mkdir(parents=True, exist_ok=True); os.replace(staged, destination)
 
 class TTSWorker(threading.Thread):
+    """Single background synthesis thread with retry, pause, and cancel support.
+
+    Ownership rules that the rest of the add-on depends on:
+
+    * The SQLite store is created *and* only ever touched on this thread.
+    * ``results`` is drained on Anki's UI thread, which owns the collection.
+    * Failed synthesis is retried in-process with exponential backoff up to
+      ``max_attempts``; only then does a job become ``failed_terminal``.
+    """
+
     def __init__(self, db_path, media_dir, results, session_id=None):
-        super().__init__(name="neuroicu-tts-worker", daemon=True); self.jobs = queue.Queue(); self.results = results; self.db_path = Path(db_path); self.media_dir = Path(media_dir); self.staging_dir = self.db_path.parent / "neuroicu_tts_staging"; self.session_id = session_id; self.store = None; self.stopping = threading.Event(); self.stopped = False; self.pending = set(); self.pending_lock = threading.Lock(); self.status_lock = threading.Lock(); self.statuses = {}; self.current_job = None; self.current_note = None; self.latest_error = None
+        super().__init__(name="neuroicu-tts-worker", daemon=True)
+        self.jobs = queue.Queue()
+        self.results = results
+        self.db_path = Path(db_path)
+        self.media_dir = Path(media_dir)
+        self.staging_dir = self.db_path.parent / "neuroicu_tts_staging"
+        self.session_id = session_id
+        self.store = None
+        self.stopping = threading.Event()
+        self.paused = threading.Event()
+        self.stopped = False
+        self.pending = set()
+        self.pending_lock = threading.Lock()
+        self.status_lock = threading.Lock()
+        self.statuses = {}
+        self.current_job = None
+        self.current_note = None
+        self.latest_error = None
+        # Deferred work is mutated by the worker thread and read/cleared by the
+        # UI thread through cancel_pending(), so it lives behind its own lock.
+        self._schedule_lock = threading.Lock()
+        self._retries: list[tuple[float, int, Job]] = []
+        self._held: list[Job] = []
+        self._sequence = 0
+
+    # ── submission ──────────────────────────────────────────────────────────
     def submit(self, j):
         if self.stopping.is_set(): return False
         key = (j.note_id, j.digest)
@@ -249,11 +445,13 @@ class TTSWorker(threading.Thread):
             self.pending.add(key)
         with self.status_lock: self.statuses[j.job_id] = "queued"
         self.jobs.put(j); return True
+
     def snapshot(self):
         with self.status_lock:
             counts = {}
             for state in self.statuses.values(): counts[state] = counts.get(state, 0) + 1
-            return QueueSnapshot(counts, self.current_job, self.current_note, latest_error=getattr(self, "latest_error", None))
+            return QueueSnapshot(counts, self.current_job, self.current_note, paused=self.paused.is_set(), latest_error=self.latest_error)
+
     def mark_committed(self, job_id, success, error=None):
         state = "succeeded" if success else ("failed_retryable" if error else "stale")
         with self.status_lock:
@@ -261,9 +459,89 @@ class TTSWorker(threading.Thread):
             if error: self.latest_error = error
         if not self.stopping.is_set():
             self.jobs.put(JobStateUpdate(job_id, state, error))
+
     def stop(self):
         if not self.stopping.is_set():
-            self.stopping.set(); self.jobs.put(None)
+            self.stopping.set()
+            self.paused.clear()
+            self.jobs.put(None)
+
+    # ── operator controls ───────────────────────────────────────────────────
+    def pause(self):
+        """Hold new jobs after the running one finishes; state updates still land."""
+        self.paused.set()
+        return True
+
+    def resume(self):
+        self.paused.clear()
+        self.jobs.put(_WAKE)  # release the blocking get() so held work restarts
+        return True
+
+    def cancel_pending(self):
+        """Drop every queued, held, and scheduled-retry job; return how many."""
+        cancelled = []
+        while True:
+            try:
+                item = self.jobs.get_nowait()
+            except queue.Empty:
+                break
+            if isinstance(item, Job):
+                cancelled.append(item)
+            elif item is None:
+                self.jobs.put(None)  # never swallow the shutdown sentinel
+                break
+        with self._schedule_lock:
+            cancelled.extend(self._held)
+            self._held = []
+            cancelled.extend(job for _, _, job in self._retries)
+            self._retries = []
+        with self.status_lock:
+            for job in cancelled:
+                self.statuses[job.job_id] = "cancelled"
+        with self.pending_lock:
+            for job in cancelled:
+                self.pending.discard((job.note_id, job.digest))
+        for job in cancelled:
+            self.jobs.put(JobStateUpdate(job.job_id, "cancelled"))
+        return len(cancelled)
+
+    # ── retry scheduling ────────────────────────────────────────────────────
+    def _schedule_retry(self, job, attempts):
+        """Queue *job* to run again after an exponential backoff delay."""
+        backoff = config.get_float("retry_backoff_seconds") * (2 ** (attempts - 1))
+        with self._schedule_lock:
+            self._sequence += 1
+            heapq.heappush(self._retries, (time.monotonic() + backoff, self._sequence, job))
+        with self.status_lock:
+            self.statuses[job.job_id] = "failed_retryable"
+        LOGGER.info("Retrying note %s in %.0fs (attempt %d)", job.note_id, backoff, attempts + 1)
+        return backoff
+
+    def _due_retry(self):
+        with self._schedule_lock:
+            if self._retries and self._retries[0][0] <= time.monotonic():
+                return heapq.heappop(self._retries)[2]
+        return None
+
+    def _next_wait(self):
+        """Seconds to block on the queue before the earliest retry comes due."""
+        with self._schedule_lock:
+            if not self._retries:
+                return None
+            return max(0.05, self._retries[0][0] - time.monotonic())
+
+    def _next_item(self):
+        """Return the next queue item, or a retry that has come due."""
+        due = self._due_retry()
+        if due is not None:
+            return due
+        timeout = self._next_wait()
+        try:
+            return self.jobs.get(timeout=timeout) if timeout is not None else self.jobs.get()
+        except queue.Empty:
+            return _WAKE
+
+    # ── main loop ───────────────────────────────────────────────────────────
     def run(self):
         # SQLite is created and used only by the worker thread.
         self.store = JobStore(self.db_path)
@@ -273,8 +551,15 @@ class TTSWorker(threading.Thread):
         if self.statuses: _emit_status()
         try:
             while True:
-                j = self.jobs.get()
+                j = self._next_item()
                 if j is None: break
+                if j is _WAKE:
+                    if not self.paused.is_set():
+                        with self._schedule_lock:
+                            held, self._held = self._held, []
+                        for job in held:
+                            self.jobs.put(job)
+                    continue
                 if isinstance(j, JobStateUpdate):
                     self.store.set_state(j.job_id, j.state, j.error)
                     continue
@@ -282,26 +567,62 @@ class TTSWorker(threading.Thread):
                 if self.stopping.is_set():
                     with self.pending_lock: self.pending.discard((j.note_id, j.digest))
                     continue
-                self.store.set_state(j.job_id, "running")
-                with self.status_lock: self.statuses[j.job_id] = "running"; self.current_job = j.job_id; self.current_note = j.note_id
-                _emit_status()
-                dest = self.staging_dir / f"{j.job_id}.mp3"
-                try:
-                    _tts_file(j.source, dest, self.stopping)
-                    self.store.set_state(j.job_id, "staged")
-                    with self.status_lock: self.latest_error = None
-                    self.results.put(Result(j, dest))
-                except Exception as exc:
-                    self.store.set_state(j.job_id, "failed_retryable", str(exc))
-                    with self.status_lock: self.statuses[j.job_id] = "failed_retryable"; self.latest_error = str(exc)
-                    self.results.put(Result(j, None, str(exc)))
-                finally:
-                    with self.status_lock: self.current_job = None; self.current_note = None
-                    with self.pending_lock: self.pending.discard((j.note_id, j.digest))
+                if self.paused.is_set():
+                    # Hold the job rather than sleeping, so commits and state
+                    # updates queued behind it keep being recorded while paused.
+                    with self._schedule_lock: self._held.append(j)
+                    with self.status_lock: self.statuses[j.job_id] = "paused"
                     _emit_status()
+                    continue
+                self._process(j)
         finally:
             self.store.close()
             self.stopped = True
+
+    def _process(self, j):
+        attempts = self.store.record_attempt(j.job_id)
+        self.store.set_state(j.job_id, "running")
+        with self.status_lock: self.statuses[j.job_id] = "running"; self.current_job = j.job_id; self.current_note = j.note_id
+        _emit_status()
+        dest = self.staging_dir / f"{j.job_id}.mp3"
+        retrying = False
+        try:
+            self.staging_dir.mkdir(parents=True, exist_ok=True)
+            _tts_file(j.source, dest, self.stopping)
+            self.store.set_state(j.job_id, "staged")
+            with self.status_lock: self.latest_error = None
+            self.results.put(Result(j, dest))
+        except Exception as exc:
+            retrying = self._handle_failure(j, exc, attempts)
+        finally:
+            with self.status_lock: self.current_job = None; self.current_note = None
+            # A job awaiting retry keeps its dedupe key, so an identical submit
+            # does not slip a second copy of the same work into the queue.
+            if not retrying:
+                with self.pending_lock: self.pending.discard((j.note_id, j.digest))
+            _emit_status()
+
+    def _handle_failure(self, j, exc, attempts):
+        """Retry transient synthesis failures; surface the rest to the UI.
+
+        Returns True when a retry was scheduled and the job still owns its
+        dedupe key.
+        """
+        message = str(exc)
+        with self.status_lock: self.latest_error = message
+        cancelled = self.stopping.is_set() or "cancelled" in message.lower()
+        if not cancelled and attempts < max(1, config.get_int("max_attempts")):
+            self.store.set_state(j.job_id, "failed_retryable", message)
+            self._schedule_retry(j, attempts)
+            return True
+        state = "cancelled" if cancelled else "failed_terminal"
+        self.store.set_state(j.job_id, state, message)
+        with self.status_lock: self.statuses[j.job_id] = state
+        if not cancelled:
+            LOGGER.error("Note %s failed after %d attempt(s): %s", j.note_id, attempts, message)
+        self.results.put(Result(j, None, message))
+        return False
+
 
 def _media_dir(): return Path(mw.col.media.dir())
 
@@ -316,6 +637,7 @@ def _managed_media_exists(sound_filename):
         return False
 
 
+_PATH_IDENTITY_CACHE_LIMIT = 64
 _path_identity_cache: dict[str, tuple[int, int, dict]] = {}
 
 
@@ -339,15 +661,17 @@ def _path_identity(path):
     if os.path.isdir(resolved):
         head = os.path.join(resolved, ".git", "HEAD")
         try:
-            with open(head, "r", encoding="utf-8") as f:
+            with open(head, encoding="utf-8") as f:
                 head_value = f.read().strip()
             identity["git_head"] = head_value
             if head_value.startswith("ref: "):
                 ref_file = os.path.join(resolved, ".git", head_value[5:])
-                with open(ref_file, "r", encoding="utf-8") as f:
+                with open(ref_file, encoding="utf-8") as f:
                     identity["git_revision"] = f.read().strip()
         except OSError:
             pass
+    if len(_path_identity_cache) >= _PATH_IDENTITY_CACHE_LIMIT:
+        _path_identity_cache.clear()
     _path_identity_cache[resolved] = (mtime, size, identity)
     return identity
 
@@ -370,11 +694,21 @@ def _synthesis_profile_digest():
         "device": config.get_device(),
         "nfe_step": F5_NFE_STEP,
         "speed": config.get_speed(),
+        "speech": config.speech_profile(),
     }
     return digest_for(json.dumps(payload, sort_keys=True, separators=(",", ":")))
 
 
 def _is_deck_eligible(did):
+    cached = _deck_eligibility.get(did)
+    if cached is not None:
+        return cached
+    result = _deck_eligible_uncached(did)
+    _deck_eligibility[did] = result
+    return result
+
+
+def _deck_eligible_uncached(did):
     try:
         deck = mw.col.decks.get(did, default=False)
         if not deck:
@@ -446,7 +780,8 @@ def upgrade_legacy_notes():
                     s = state_for(extra)
                     artifact_digest = generation_digest(s.digest, profile_digest)
                     expected = filename(note.id, artifact_digest)
-                    if _managed_media_exists(expected) or _managed_media_exists(s.sound_filename):
+                    reusable = is_managed_filename(s.sound_filename) and _managed_media_exists(s.sound_filename)
+                    if _managed_media_exists(expected) or reusable:
                         actual_file = expected if _managed_media_exists(expected) else s.sound_filename
                         note["Extra"] = managed_extra(extra, actual_file, s.digest, profile_digest)
                         mw.col.update_note(note)
@@ -508,6 +843,7 @@ def _commit(r: Result):
 
 def scan_collection():
     global _last_scan_at, _last_event
+    _invalidate_scope_cache()
     try:
         upgrade_legacy_notes()
         profile_digest = _synthesis_profile_digest()
@@ -668,16 +1004,34 @@ def _start_engine_test():
     return True
 
 
-def _scope_snapshot():
+def _scope_snapshot(force=False):
+    """Return scope counts, reusing a recent result unless *force* is set.
+
+    Counting eligibility opens every candidate note, which is far too expensive
+    to repeat on each queue transition, so results are cached for
+    SCOPE_CACHE_SECONDS and invalidated whenever scope inputs change.
+    """
+    global _scope_cache
     description = f"Pilot tag {PILOT_TAG}" if PILOT_ONLY else "Eligible Neuro ICU notes"
+    mode = "pilot" if PILOT_ONLY else "full"
     if mw is None:
-        return ScopeSnapshot("pilot" if PILOT_ONLY else "full", description)
+        return ScopeSnapshot(mode, description)
+    if not force:
+        with _scope_cache_lock:
+            cached = _scope_cache
+        if cached is not None and time.monotonic() - cached[0] < SCOPE_CACHE_SECONDS:
+            counted = cached[1]
+            return ScopeSnapshot(mode, description, counted.eligible_count, counted.selected_count, _last_scan_at)
     try:
         note_ids = mw.col.find_notes(f'note:"{MODEL}"')
         eligible = sum(_eligible(mw.col.get_note(note_id)) for note_id in note_ids)
-        return ScopeSnapshot("pilot" if PILOT_ONLY else "full", description, eligible, eligible, _last_scan_at)
+        snapshot = ScopeSnapshot(mode, description, eligible, eligible, _last_scan_at)
     except Exception:
-        return ScopeSnapshot("pilot" if PILOT_ONLY else "full", description, None, None, _last_scan_at)
+        LOGGER.debug("Scope count unavailable", exc_info=True)
+        return ScopeSnapshot(mode, description, None, None, _last_scan_at)
+    with _scope_cache_lock:
+        _scope_cache = (time.monotonic(), snapshot)
+    return snapshot
 
 
 def _queue_snapshot():
@@ -772,30 +1126,50 @@ def _settings_snapshot():
 
 def _save_settings(values):
     """G1 — validate and persist Settings-tab values; return error strings."""
-    global PILOT_TAG, PILOT_ONLY
-    updates = dict(values)
-    raw_speed = updates.get("f5_speed")
-    if isinstance(raw_speed, str):
-        try:
-            updates["f5_speed"] = float(raw_speed)
-        except ValueError:
-            pass  # validate() reports the range error for non-numeric input
+    updates = _coerce_settings(values)
     try:
         errors = config.save(updates)
     except OSError as exc:
         LOGGER.error("Could not save settings: %s", exc)
         return [str(exc)]
     if not errors:
-        PILOT_TAG, PILOT_ONLY = config.get("pilot_tag"), bool(config.get("pilot_only"))
+        _refresh_engine_globals()
+        _apply_log_level()
         _last_event_set("Settings saved")
     return errors
 
 
+_NUMERIC_SETTINGS = {
+    "f5_speed": float,
+    "retry_backoff_seconds": float,
+    "f5_nfe_step": int,
+    "max_chunk_chars": int,
+    "max_attempts": int,
+}
+
+
+def _coerce_settings(values):
+    """Turn Settings-tab strings into the types the config schema expects.
+
+    Values that will not convert are passed through untouched so that
+    ``config.validate`` reports one clear range error instead of a TypeError.
+    """
+    updates = dict(values)
+    for key, caster in _NUMERIC_SETTINGS.items():
+        raw = updates.get(key)
+        if isinstance(raw, str):
+            try:
+                updates[key] = caster(raw)
+            except ValueError:
+                pass
+    return updates
+
+
 def _reload_settings():
     """G1 — re-read config.json when changed and refresh live scope values."""
-    global PILOT_TAG, PILOT_ONLY
     config.reload_config_if_changed()
-    PILOT_TAG, PILOT_ONLY = config.get("pilot_tag"), bool(config.get("pilot_only"))
+    _refresh_engine_globals()
+    _apply_log_level()
     _emit_status()
     return True
 
@@ -817,6 +1191,61 @@ def _queue_counts():
     except Exception as exc:
         LOGGER.warning("Queue counts unavailable: %s", exc)
         return {}
+
+
+def _queue_pause(paused):
+    """Pause or resume the worker; the running job always finishes first."""
+    worker = getattr(mw, "_neuroicu_tts_worker", None) if mw is not None else None
+    if worker is None:
+        return False
+    worker.pause() if paused else worker.resume()
+    _last_event_set("Queue paused" if paused else "Queue resumed")
+    return True
+
+
+def _queue_cancel():
+    """Cancel everything not yet synthesized; return how many jobs were dropped."""
+    worker = getattr(mw, "_neuroicu_tts_worker", None) if mw is not None else None
+    in_memory = worker.cancel_pending() if worker is not None else 0
+    try:
+        store = JobStore(_jobs_db_path())
+        try:
+            persisted = store.cancel_pending()
+        finally:
+            store.close()
+    except Exception:
+        LOGGER.exception("Could not cancel persisted jobs")
+        persisted = 0
+    cancelled = max(in_memory, persisted)
+    _last_event_set(f"Cancelled {cancelled} pending job(s)")
+    return cancelled
+
+
+def _queue_retry_failed():
+    """Re-queue failed and cancelled jobs against the current note content."""
+    worker = getattr(mw, "_neuroicu_tts_worker", None) if mw is not None else None
+    if worker is None:
+        return 0
+    try:
+        store = JobStore(_jobs_db_path())
+        try:
+            rows = store.retryable_jobs()
+        finally:
+            store.close()
+    except Exception:
+        LOGGER.exception("Could not read retryable jobs")
+        return 0
+    requeued = 0
+    profile_digest = _synthesis_profile_digest()
+    for _job_id, note_id, _source, _digest in rows:
+        try:
+            # Re-derive from the note so a retry never replays stale text.
+            if _submit(mw.col.get_note(note_id), force=True, profile_digest=profile_digest):
+                requeued += 1
+        except Exception:
+            LOGGER.exception("Could not re-queue note %s", note_id)
+    _last_event_set(f"Re-queued {requeued} of {len(rows)} failed job(s)")
+    return requeued
 
 
 def _log_tail(lines=200):
@@ -868,6 +1297,7 @@ def _toggle_pilot(enabled):
     if errors:
         return False
     PILOT_ONLY = bool(enabled)
+    _invalidate_scope_cache()
     _last_event_set(f"Pilot-only scope {'enabled' if PILOT_ONLY else 'disabled'}")
     return True
 
@@ -931,6 +1361,7 @@ def _update_pilot_tag(value):
         LOGGER.error("Could not save pilot tag: %s", "; ".join(errors))
         return False
     PILOT_TAG = value
+    _invalidate_scope_cache()
     _last_event = f"Pilot tag updated to {value}"
     _emit_status()
     return True
@@ -957,6 +1388,9 @@ def _show_center():
         on_full_deck_info=_full_deck_info,
         on_full_deck_convert=_full_deck_convert,
         on_upgrade_legacy=upgrade_legacy_notes,
+        on_queue_pause=_queue_pause,
+        on_queue_cancel=_queue_cancel,
+        on_queue_retry=_queue_retry_failed,
     )
     mw._neuroicu_tts_dialog = d
     d.show()

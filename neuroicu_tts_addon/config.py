@@ -30,7 +30,7 @@ from typing import Any
 LOGGER = logging.getLogger("neuroicu_tts")
 
 # ── schema ──────────────────────────────────────────────────────────────────
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 DEFAULTS: dict[str, Any] = {
     "f5_tts_repo": "",
@@ -44,14 +44,45 @@ DEFAULTS: dict[str, Any] = {
     "ffmpeg_path": "",
     "pilot_only": True,
     "pilot_tag": "neuroicu-tts-pilot",
+    # schema 3 — speech shaping, chunking, and queue reliability
+    "normalize_speech": True,
+    "expand_abbreviations": True,
+    "speech_replacements": {},
+    "max_chunk_chars": 800,
+    "max_attempts": 3,
+    "retry_backoff_seconds": 30.0,
+    "log_level": "INFO",
 }
 
-# Keys the user may edit at runtime.  Everything else is engine-locked:
+# Keys the user may edit at runtime through the Control Center.  Engine paths
+# became editable in schema 3; previously they required hand-editing this file.
 # save() silently ignores keys outside this set (and unknown keys).
-EDITABLE_KEYS = frozenset({"f5_speed", "f5_device", "ffmpeg_path", "pilot_only", "pilot_tag"})
+ENGINE_KEYS = frozenset(
+    {"f5_tts_repo", "f5_tts_python", "f5_model", "f5_ref_audio", "f5_ref_text", "f5_nfe_step"}
+)
+EDITABLE_KEYS = frozenset(
+    {
+        "f5_speed",
+        "f5_device",
+        "ffmpeg_path",
+        "pilot_only",
+        "pilot_tag",
+        "normalize_speech",
+        "expand_abbreviations",
+        "speech_replacements",
+        "max_chunk_chars",
+        "max_attempts",
+        "retry_backoff_seconds",
+        "log_level",
+    }
+) | ENGINE_KEYS
 
 _DEVICE_CHOICES = {"cpu", "mps", "cuda"}
+_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR"}
 _SPEED_MIN, _SPEED_MAX = 0.5, 2.0
+_NFE_MIN, _NFE_MAX = 4, 128
+_CHUNK_MIN, _CHUNK_MAX = 100, 5000
+_ATTEMPTS_MIN, _ATTEMPTS_MAX = 1, 10
 
 # ── paths ───────────────────────────────────────────────────────────────────
 CONFIG_DIR = Path(__file__).resolve().parent
@@ -97,6 +128,86 @@ def validate(raw: dict[str, Any]) -> list[str]:
     tag = raw.get("pilot_tag", DEFAULTS["pilot_tag"])
     if not isinstance(tag, str) or not tag or any(character.isspace() for character in tag):
         errors.append("pilot_tag must be non-empty with no whitespace")
+
+    errors.extend(_validate_engine(raw))
+    errors.extend(_validate_speech(raw))
+    return errors
+
+
+def _validate_engine(raw: dict[str, Any]) -> list[str]:
+    """Engine paths are optional until set, but must be usable once they are."""
+    errors: list[str] = []
+
+    repo = str(raw.get("f5_tts_repo", "") or "").strip()
+    if repo:
+        repo_path = Path(repo)
+        if not repo_path.is_dir():
+            errors.append(f"f5_tts_repo is not a directory: {repo}")
+        elif not (repo_path / "src" / "f5_tts" / "infer" / "infer_cli.py").is_file():
+            errors.append("f5_tts_repo does not contain src/f5_tts/infer/infer_cli.py")
+
+    python = str(raw.get("f5_tts_python", "") or "").strip()
+    if not python:
+        errors.append("f5_tts_python must not be empty")
+    elif os.sep in python and not (Path(python).is_file() and os.access(python, os.X_OK)):
+        errors.append(f"f5_tts_python is not an executable file: {python}")
+    # A bare command name is resolved against PATH at run time rather than here:
+    # PATH inside a GUI launch differs from PATH in a shell, and blocking the
+    # save would strand the user unable to edit any other setting.
+
+    if not str(raw.get("f5_model", "") or "").strip():
+        errors.append("f5_model must not be empty")
+
+    reference = str(raw.get("f5_ref_audio", "") or "").strip()
+    if reference:
+        candidate = Path(reference)
+        if not candidate.is_absolute() and repo:
+            candidate = Path(repo) / reference
+        if not candidate.is_file():
+            errors.append(f"f5_ref_audio does not exist: {reference}")
+        elif not str(raw.get("f5_ref_text", "") or "").strip():
+            errors.append("f5_ref_text must transcribe f5_ref_audio exactly")
+
+    try:
+        nfe = int(raw.get("f5_nfe_step", DEFAULTS["f5_nfe_step"]))
+        if not _NFE_MIN <= nfe <= _NFE_MAX:
+            raise ValueError
+    except (TypeError, ValueError):
+        errors.append(f"f5_nfe_step must be an integer between {_NFE_MIN} and {_NFE_MAX}")
+
+    return errors
+
+
+def _validate_speech(raw: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+
+    replacements = raw.get("speech_replacements", {})
+    if not isinstance(replacements, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in replacements.items()
+    ):
+        errors.append("speech_replacements must be an object of text->text pairs")
+
+    for key, low, high in (
+        ("max_chunk_chars", _CHUNK_MIN, _CHUNK_MAX),
+        ("max_attempts", _ATTEMPTS_MIN, _ATTEMPTS_MAX),
+    ):
+        try:
+            value = int(raw.get(key, DEFAULTS[key]))
+            if not low <= value <= high:
+                raise ValueError
+        except (TypeError, ValueError):
+            errors.append(f"{key} must be an integer between {low} and {high}")
+
+    try:
+        backoff = float(raw.get("retry_backoff_seconds", DEFAULTS["retry_backoff_seconds"]))
+        if not 0 <= backoff <= 3600:
+            raise ValueError
+    except (TypeError, ValueError):
+        errors.append("retry_backoff_seconds must be a number between 0 and 3600")
+
+    level = str(raw.get("log_level", DEFAULTS["log_level"])).strip().upper()
+    if level not in _LOG_LEVELS:
+        errors.append("log_level must be DEBUG, INFO, WARNING, or ERROR")
 
     return errors
 
@@ -180,6 +291,43 @@ def get_speed() -> str:
 
 def get_device() -> str:
     return str(_cfg.get("f5_device", DEFAULTS["f5_device"]))
+
+
+def get_int(key: str) -> int:
+    """Return *key* coerced to int, falling back to its default when unusable."""
+    try:
+        return int(_cfg.get(key, DEFAULTS[key]))
+    except (TypeError, ValueError):
+        return int(DEFAULTS[key])
+
+
+def get_float(key: str) -> float:
+    try:
+        return float(_cfg.get(key, DEFAULTS[key]))
+    except (TypeError, ValueError):
+        return float(DEFAULTS[key])
+
+
+def get_bool(key: str) -> bool:
+    return bool(_cfg.get(key, DEFAULTS[key]))
+
+
+def get_speech_replacements() -> dict[str, str]:
+    """User-supplied pronunciation overrides; invalid entries are dropped."""
+    raw = _cfg.get("speech_replacements", {})
+    if not isinstance(raw, dict):
+        return {}
+    return {str(k): str(v) for k, v in raw.items() if isinstance(k, str) and k}
+
+
+def speech_profile() -> dict[str, Any]:
+    """The subset of settings that changes generated audio without changing text."""
+    return {
+        "normalize_speech": get_bool("normalize_speech"),
+        "expand_abbreviations": get_bool("expand_abbreviations"),
+        "speech_replacements": dict(sorted(get_speech_replacements().items())),
+        "max_chunk_chars": get_int("max_chunk_chars"),
+    }
 
 
 def get_ffmpeg_path() -> str | None:
