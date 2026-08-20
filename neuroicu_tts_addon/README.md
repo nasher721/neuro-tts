@@ -18,12 +18,10 @@ restart or manual file edit needed.
 The add-on runs F5-TTS locally through its CLI using Apple Silicon MPS.
 F5-TTS is installed in the isolated environment configured in `config.json`.
 
-Safe settings (`f5_speed`, `f5_device`, `ffmpeg_path`, `pilot_tag`,
-`pilot_only`) are edited in the Control Center's Settings and Scope tabs with
-inline validation and atomic saves. Engine-locked keys (`f5_tts_repo`,
-`f5_tts_python`, `f5_model`, `f5_ref_audio`, `f5_ref_text`, `f5_nfe_step`) are
-still edited in `config.json` by hand, or set via environment variables before
-launching Anki:
+Every setting is edited in the Control Center's Settings and Scope tabs with
+inline validation and atomic saves — engine paths included, as of schema 3.
+Saved engine values apply without restarting Anki. Environment variables still
+take precedence when set, which keeps machine-local paths out of `config.json`:
 
 ```sh
 export F5_TTS_REPO=/path/to/F5-TTS
@@ -39,6 +37,14 @@ Anki media.
 ## Behavior
 
 - A single background worker keeps F5-TTS and FFmpeg off Anki's UI thread.
+- Note text is normalized for speech before synthesis: dose and unit shorthand,
+  arrows and trend symbols, dosing intervals, numeric ranges and comparisons,
+  and clinical abbreviations become spoken words. Cloze markup keeps the answer
+  and drops the hint. See `text_normalize.py`; both passes are configurable.
+- Notes longer than `max_chunk_chars` are split at sentence boundaries,
+  synthesized in pieces, and concatenated with FFmpeg.
+- Failed synthesis is retried with exponential backoff up to `max_attempts`
+  before the note is marked `failed_terminal`; cancellations are never retried.
 - Note-save and sync hooks enqueue reconciliation; an immediate scan is also
   available from the Tools menu.
 - Queue state is stored in the active Anki profile and interrupted work is
@@ -62,7 +68,10 @@ Anki media.
 - Closing or switching profiles cancels the active synthesis subprocess and
   leaves interrupted work retryable for the next profile open.
 - Failed generation or note commit leaves the existing note content intact and
-  writes details to `neuroicu_tts.log`.
+  writes details to `neuroicu_tts.log`, which rotates at 2 MB with three backups.
+- Filenames parsed out of existing note HTML are validated against the managed
+  filename pattern and HTML-escaped before being written back, so hand-edited
+  or hostile markup cannot be reflected into a note.
 - Ordinary generation never deletes existing media.
 - The Maintenance tab includes an "Upgrade Legacy Markers" action to instantly
   upgrade existing cards to click-to-play without re-running synthesis.
@@ -73,16 +82,19 @@ Anki media.
 
 - **Overview** — status dashboard, recommended next action, pilot-tag editing,
   current-card generation, and collection scans.
-- **Settings** — edit speed, device, ffmpeg path, and pilot tag with inline
-  validation; Save/Revert/Reload. Engine settings display read-only. Saved
-  safe knobs apply at the next job start; running jobs are never interrupted.
-- **Queue** — read-only job counts by status.
+- **Settings** — edit speed, device, ffmpeg path, and pilot tag; the speech
+  shaping and queue-reliability knobs; and the engine paths, model, reference
+  voice, and NFE steps. Inline validation with Save/Revert/Reload. Saved values
+  apply at the next job start; running jobs are never interrupted.
+- **Queue** — job counts by status and progress, plus Pause/Resume (the running
+  job finishes first), Retry failed (re-queues failed and cancelled notes from
+  their current text), and Cancel pending.
 - **Diagnostics** — engine test and the tail of `neuroicu_tts.log`.
 - **Maintenance** — generated-audio storage size and clearing finished jobs.
 - **Scope** — pilot-only toggle and Full-Deck Convert, which shows an impact
   estimate (note count and runtime) before enqueueing deduplicated jobs.
 
-Configuration is versioned (`schema_version` 2): old flat `config.json` files
+Configuration is versioned (`schema_version` 3): older `config.json` files
 migrate automatically, unknown keys are preserved, and a corrupt file falls
 back to defaults with a logged warning instead of breaking the add-on. Reload
 detection compares file mtimes, so two saves within the same filesystem

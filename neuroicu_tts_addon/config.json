@@ -1,4 +1,5 @@
 {
+  "schema_version": 3,
   "f5_tts_repo": "",
   "f5_tts_python": "python3",
   "f5_model": "F5TTS_v1_Base",
@@ -6,6 +7,15 @@
   "f5_ref_text": "",
   "f5_device": "cpu",
   "f5_nfe_step": 16,
+  "f5_speed": 1.0,
+  "ffmpeg_path": "",
   "pilot_only": true,
-  "pilot_tag": "neuroicu-tts-pilot"
+  "pilot_tag": "neuroicu-tts-pilot",
+  "normalize_speech": true,
+  "expand_abbreviations": true,
+  "speech_replacements": {},
+  "max_chunk_chars": 800,
+  "max_attempts": 3,
+  "retry_backoff_seconds": 30.0,
+  "log_level": "INFO"
 }

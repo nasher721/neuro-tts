@@ -7,6 +7,7 @@ so a failure leaves the dashboard usable.
 
 from __future__ import annotations
 
+import os
 from html import escape
 from typing import Callable
 
@@ -100,6 +101,9 @@ if QDialog is not None:
             on_full_deck_info: Callable[[], tuple] | None = None,
             on_full_deck_convert: Callable[[], tuple] | None = None,
             on_upgrade_legacy: Callable[[], int] | None = None,
+            on_queue_pause: Callable[[bool], bool] | None = None,
+            on_queue_cancel: Callable[[], int] | None = None,
+            on_queue_retry: Callable[[], int] | None = None,
         ) -> None:
             super().__init__(parent)
             self._status_service = status_service
@@ -119,6 +123,10 @@ if QDialog is not None:
             self._on_full_deck_info = on_full_deck_info
             self._on_full_deck_convert = on_full_deck_convert
             self._on_upgrade_legacy = on_upgrade_legacy
+            self._on_queue_pause = on_queue_pause
+            self._on_queue_cancel = on_queue_cancel
+            self._on_queue_retry = on_queue_retry
+            self._queue_paused = False
             self._pilot_tag = pilot_tag
             self._closed = False
             self._recommended_action = ""
@@ -272,24 +280,67 @@ if QDialog is not None:
             form.addRow("Pilot tag", self.settings_tag_edit)
             layout.addLayout(form)
 
-            locked = QGroupBox("Engine settings (read-only)")
-            locked_layout = QFormLayout(locked)
-            self.locked_fields: dict[str, QLineEdit] = {}
-            for key, label in (
-                ("f5_tts_repo", "F5-TTS repo"),
-                ("f5_tts_python", "F5-TTS python"),
-                ("f5_model", "Model"),
-                ("f5_ref_audio", "Reference audio"),
-                ("f5_ref_text", "Reference text"),
-                ("f5_nfe_step", "NFE steps"),
+            speech = QGroupBox("Speech shaping")
+            speech_layout = QFormLayout(speech)
+            self.normalize_checkbox = QCheckBox("Rewrite symbols, doses, and units for speech")
+            self.normalize_checkbox.setAccessibleName("Normalize text for speech")
+            self.normalize_checkbox.setToolTip(
+                "Turn written shorthand such as '10mg', '->', and 'q6h' into words before synthesis."
+            )
+            speech_layout.addRow(self.normalize_checkbox)
+            self.abbreviations_checkbox = QCheckBox("Expand clinical abbreviations")
+            self.abbreviations_checkbox.setAccessibleName("Expand clinical abbreviations")
+            self.abbreviations_checkbox.setToolTip(
+                "Speak 'SAH' as 'subarachnoid hemorrhage' instead of spelling out the letters."
+            )
+            speech_layout.addRow(self.abbreviations_checkbox)
+            self.chunk_edit = QLineEdit()
+            self.chunk_edit.setAccessibleName("Maximum characters per synthesis chunk")
+            self.chunk_edit.setToolTip("Longer notes are split at sentence boundaries and joined back together.")
+            speech_layout.addRow("Max chunk characters", self.chunk_edit)
+            layout.addWidget(speech)
+
+            reliability = QGroupBox("Queue reliability")
+            reliability_layout = QFormLayout(reliability)
+            self.attempts_edit = QLineEdit()
+            self.attempts_edit.setAccessibleName("Maximum attempts per note")
+            self.attempts_edit.setToolTip("How many times a failing note is retried before it is marked failed.")
+            reliability_layout.addRow("Max attempts", self.attempts_edit)
+            self.backoff_edit = QLineEdit()
+            self.backoff_edit.setAccessibleName("Retry backoff seconds")
+            self.backoff_edit.setToolTip("Base delay before the first retry; it doubles with each further attempt.")
+            reliability_layout.addRow("Retry backoff (s)", self.backoff_edit)
+            self.log_level_combo = QComboBox()
+            self.log_level_combo.addItems(["DEBUG", "INFO", "WARNING", "ERROR"])
+            self.log_level_combo.setAccessibleName("Log level")
+            reliability_layout.addRow("Log level", self.log_level_combo)
+            layout.addWidget(reliability)
+
+            engine = QGroupBox("Engine settings")
+            engine.setToolTip(
+                "Changing any of these re-queues affected notes, because the audio they produce changes."
+            )
+            engine_layout = QFormLayout(engine)
+            self.engine_fields: dict[str, QLineEdit] = {}
+            for key, label, hint in (
+                ("f5_tts_repo", "F5-TTS repo", "Checkout containing src/f5_tts/infer/infer_cli.py."),
+                ("f5_tts_python", "F5-TTS python", "Interpreter of the F5-TTS environment."),
+                ("f5_model", "Model", "F5-TTS model name, for example F5TTS_v1_Base."),
+                ("f5_ref_audio", "Reference audio", "Reference recording; relative paths resolve inside the repo."),
+                ("f5_ref_text", "Reference text", "Exact transcript of the reference recording."),
+                ("f5_nfe_step", "NFE steps", "Denoising steps: higher is slower and slightly cleaner."),
             ):
                 field = QLineEdit()
-                field.setReadOnly(True)
-                field.setAccessibleName(f"{label} (locked)")
-                field.setToolTip("Engine-locked; edit config.json by hand to change.")
-                self.locked_fields[key] = field
-                locked_layout.addRow(label, field)
-            layout.addWidget(locked)
+                field.setAccessibleName(label)
+                field.setToolTip(hint)
+                self.engine_fields[key] = field
+                engine_layout.addRow(label, field)
+            self.engine_env_note = QLabel()
+            self.engine_env_note.setWordWrap(True)
+            self.engine_env_note.setAccessibleName("Engine environment override note")
+            self.engine_env_note.setVisible(False)
+            engine_layout.addRow(self.engine_env_note)
+            layout.addWidget(engine)
 
             self.settings_error = QLabel()
             self.settings_error.setWordWrap(True)
@@ -325,16 +376,38 @@ if QDialog is not None:
             self.device_combo.setCurrentText(str(snapshot.get("f5_device", "cpu")))
             self.ffmpeg_edit.setText(str(snapshot.get("ffmpeg_path", "") or ""))
             self.settings_tag_edit.setText(str(snapshot.get("pilot_tag", "")))
-            for key, field in self.locked_fields.items():
+            self.normalize_checkbox.setChecked(bool(snapshot.get("normalize_speech", True)))
+            self.abbreviations_checkbox.setChecked(bool(snapshot.get("expand_abbreviations", True)))
+            self.chunk_edit.setText(str(snapshot.get("max_chunk_chars", 800)))
+            self.attempts_edit.setText(str(snapshot.get("max_attempts", 3)))
+            self.backoff_edit.setText(str(snapshot.get("retry_backoff_seconds", 30)))
+            self.log_level_combo.setCurrentText(str(snapshot.get("log_level", "INFO")).upper())
+            for key, field in self.engine_fields.items():
                 field.setText(str(snapshot.get(key, "")))
+            overridden = [name for name in ("F5_TTS_REPO", "F5_TTS_PYTHON") if os.environ.get(name)]
+            if overridden:
+                # An environment override silently wins over whatever is saved,
+                # so say so rather than letting the field look authoritative.
+                self.engine_env_note.setText(
+                    "Overridden by environment: " + ", ".join(overridden) + ". Saved values are ignored while set."
+                )
+            self.engine_env_note.setVisible(bool(overridden))
 
         def _settings_values(self) -> dict:
-            return {
+            values = {
                 "f5_speed": self.speed_edit.text().strip(),
                 "f5_device": self.device_combo.currentText(),
                 "ffmpeg_path": self.ffmpeg_edit.text().strip(),
                 "pilot_tag": self.settings_tag_edit.text().strip(),
+                "normalize_speech": self.normalize_checkbox.isChecked(),
+                "expand_abbreviations": self.abbreviations_checkbox.isChecked(),
+                "max_chunk_chars": self.chunk_edit.text().strip(),
+                "max_attempts": self.attempts_edit.text().strip(),
+                "retry_backoff_seconds": self.backoff_edit.text().strip(),
+                "log_level": self.log_level_combo.currentText(),
             }
+            values.update({key: field.text().strip() for key, field in self.engine_fields.items()})
+            return values
 
         def _settings_save_clicked(self) -> None:
             if not self._on_save_settings:
@@ -369,7 +442,8 @@ if QDialog is not None:
             self.settings_status.setText("Settings reloaded from disk.")
 
         # ── Queue tab (G2, read-only) ───────────────────────────────────────
-        _QUEUE_STATES = ("queued", "running", "staged", "failed_retryable", "failed_terminal", "succeeded", "stale")
+        _QUEUE_STATES = ("queued", "running", "staged", "paused", "failed_retryable", "failed_terminal", "cancelled", "succeeded", "stale")
+        _PENDING_STATES = ("queued", "running", "staged", "paused", "failed_retryable")
 
         def _build_queue_tab(self) -> QWidget:
             tab = QWidget()
@@ -384,19 +458,78 @@ if QDialog is not None:
             self.queue_counts_label.setWordWrap(True)
             self.queue_counts_label.setAccessibleName("Queue counts by status")
             layout.addWidget(self.queue_counts_label)
+            self.queue_status = QLabel()
+            self.queue_status.setWordWrap(True)
+            self.queue_status.setAccessibleName("Queue action status")
+            layout.addWidget(self.queue_status)
+
+            row = QHBoxLayout()
             refresh = QPushButton("Refresh queue")
             refresh.setAccessibleName("Refresh queue counts")
             refresh.clicked.connect(self._queue_refresh)
-            layout.addWidget(refresh)
+            row.addWidget(refresh)
+
+            self.queue_pause_button = QPushButton("Pause queue")
+            self.queue_pause_button.setAccessibleName("Pause or resume the generation queue")
+            self.queue_pause_button.setToolTip("Stop starting new jobs; the job already running finishes first.")
+            self.queue_pause_button.setEnabled(self._on_queue_pause is not None)
+            self.queue_pause_button.clicked.connect(self._queue_pause_clicked)
+            row.addWidget(self.queue_pause_button)
+
+            self.queue_retry_button = QPushButton("Retry failed")
+            self.queue_retry_button.setAccessibleName("Re-queue failed jobs")
+            self.queue_retry_button.setToolTip("Queue every failed or cancelled note again using its current text.")
+            self.queue_retry_button.setEnabled(self._on_queue_retry is not None)
+            self.queue_retry_button.clicked.connect(self._queue_retry_clicked)
+            row.addWidget(self.queue_retry_button)
+
+            self.queue_cancel_button = QPushButton("Cancel pending")
+            self.queue_cancel_button.setAccessibleName("Cancel pending jobs")
+            self.queue_cancel_button.setToolTip("Drop every job that has not been synthesized yet.")
+            self.queue_cancel_button.setEnabled(self._on_queue_cancel is not None)
+            self.queue_cancel_button.clicked.connect(self._queue_cancel_clicked)
+            row.addWidget(self.queue_cancel_button)
+            layout.addLayout(row)
             layout.addStretch(1)
             return tab
+
+        def _queue_pause_clicked(self) -> None:
+            if not self._on_queue_pause:
+                return
+            target = not self._queue_paused
+            self._run_callback(lambda: self._on_queue_pause(target), "", "Queue pause")
+            self._queue_paused = target
+            self.queue_pause_button.setText("Resume queue" if target else "Pause queue")
+            self.queue_status.setText("Queue paused." if target else "Queue running.")
+            self._queue_refresh()
+
+        def _queue_retry_clicked(self) -> None:
+            self._queue_action(self._on_queue_retry, "Retry failed", "Re-queued {} job(s).")
+
+        def _queue_cancel_clicked(self) -> None:
+            self._queue_action(self._on_queue_cancel, "Cancel pending", "Cancelled {} pending job(s).")
+
+        def _queue_action(self, callback, label: str, template: str) -> None:
+            if not callback:
+                return
+            outcome: dict = {}
+
+            def invoke() -> bool:
+                outcome["count"] = callback()
+                return True
+
+            self._run_callback(invoke, "", label)
+            if "count" in outcome:
+                self.queue_status.setText(template.format(outcome["count"]))
+            self._queue_refresh()
 
         def _queue_refresh(self) -> None:
             counts = self._on_queue_counts() if self._on_queue_counts else {}
             lines = [f"{state}: {counts.get(state, 0)}" for state in self._QUEUE_STATES]
             self.queue_counts_label.setText("\n".join(lines))
             total = sum(counts.get(s, 0) for s in self._QUEUE_STATES)
-            done = counts.get("succeeded", 0) + counts.get("failed_terminal", 0) + counts.get("stale", 0)
+            pending = sum(counts.get(s, 0) for s in self._PENDING_STATES)
+            done = total - pending
             if total > 0:
                 pct = int((done / total) * 100)
                 self.queue_progress.setValue(pct)
@@ -404,6 +537,8 @@ if QDialog is not None:
             else:
                 self.queue_progress.setValue(100)
                 self.queue_progress.setFormat("Queue idle (0 pending)")
+            if getattr(self, "queue_pause_button", None) is not None:
+                self.queue_pause_button.setText("Resume queue" if self._queue_paused else "Pause queue")
 
         # ── Diagnostics tab (G3, read-only) ─────────────────────────────────
         def _build_diagnostics_tab(self) -> QWidget:

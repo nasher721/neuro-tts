@@ -46,10 +46,11 @@ class ConfigTestCase(unittest.TestCase):
 
 class MigrationTests(ConfigTestCase):
     def test_migrate_fills_defaults_stamps_version_preserves_unknown(self):
-        # G8.1 — v1 flat config gains defaults + schema_version=2, unknown keys kept.
+        # G8.1 — a flat legacy config gains defaults + the current schema version,
+        # and unknown keys are preserved for forward compatibility.
         raw = {"f5_speed": 1.5, "custom_future_key": {"nested": True}}
         migrated = config.migrate(raw)
-        self.assertEqual(migrated["schema_version"], 2)
+        self.assertEqual(migrated["schema_version"], config.SCHEMA_VERSION)
         self.assertEqual(migrated["f5_speed"], 1.5)
         self.assertEqual(migrated["custom_future_key"], {"nested": True})
         for key in config.DEFAULTS:
@@ -58,7 +59,7 @@ class MigrationTests(ConfigTestCase):
     def test_load_upgrades_v1_file_in_place(self):
         self.write_raw({"f5_speed": 1.25, "unknown": "kept"})
         config.load()
-        self.assertEqual(config.get("schema_version"), 2)
+        self.assertEqual(config.get("schema_version"), config.SCHEMA_VERSION)
         self.assertEqual(config.get("unknown"), "kept")
         self.assertEqual(config.get_speed(), "1.25")
 
@@ -121,7 +122,7 @@ class SaveTests(ConfigTestCase):
         self.assertEqual(errors, [])
         on_disk = self.read_disk()
         self.assertEqual(on_disk["f5_speed"], 1.5)
-        self.assertEqual(on_disk["schema_version"], 2)
+        self.assertEqual(on_disk["schema_version"], config.SCHEMA_VERSION)
         self.assertEqual(config.get_speed(), "1.5")
         self.assertFalse(self.path.with_suffix(".json.tmp").exists())
 
@@ -134,15 +135,22 @@ class SaveTests(ConfigTestCase):
         self.assertIn("speed must be between 0.5 and 2.0", errors)
         self.assertEqual(self.path.read_text(encoding="utf-8"), before)
 
-    def test_save_rejects_locked_engine_keys(self):
-        # G8.5 — locked keys ignored; persisted file unchanged for that key.
+    def test_save_persists_engine_keys_and_ignores_unknown_keys(self):
+        # Engine settings became Control Center editable in schema 3; unknown
+        # keys are still dropped rather than written back.
         self.write_raw({"f5_model": "F5TTS_v1_Base", "f5_speed": 1.0})
         config.load()
+        self.assertEqual(config.save({"f5_model": "OtherModel", "unknown_key": 1}), [])
+        self.assertEqual(config.get("f5_model"), "OtherModel")
+        self.assertEqual(self.read_disk()["f5_model"], "OtherModel")
+        self.assertNotIn("unknown_key", self.read_disk())
+
+    def test_save_rejects_an_empty_model_name(self):
+        self.write_raw({"f5_speed": 1.0})
+        config.load()
         before = self.path.read_text(encoding="utf-8")
-        errors = config.save({"f5_model": "OtherModel", "unknown_key": 1})
-        self.assertEqual(errors, [])
+        self.assertIn("f5_model must not be empty", config.save({"f5_model": "  "}))
         self.assertEqual(self.path.read_text(encoding="utf-8"), before)
-        self.assertEqual(config.get("f5_model"), "F5TTS_v1_Base")
 
     def test_save_preserves_unknown_keys_already_loaded(self):
         self.write_raw({"future_key": "preserve-me", "f5_speed": 1.0})

@@ -86,6 +86,16 @@ def state_for(extra: str) -> TTSState:
     return TTSState(text, digest_for(text), marker_digest, sound_filename, profile_digest)
 
 
+def is_managed_filename(name: str | None) -> bool:
+    """Return whether *name* is a filename this add-on generated.
+
+    Used before reusing a name parsed out of note HTML, so that hand-edited or
+    hostile ``src`` values are never written back into a note or resolved
+    against the media folder.
+    """
+    return bool(name) and MANAGED_FILENAME_RE.fullmatch(str(name).strip()) is not None
+
+
 def is_legacy_extra(extra: str) -> bool:
     """Return True if extra contains the legacy [sound:...] managed block instead of the click-to-play widget."""
     if not extra:
@@ -97,7 +107,12 @@ def is_legacy_extra(extra: str) -> bool:
 
 
 def player_html(filename: str) -> str:
-    """Return the accessible, responsive click-to-play HTML player widget with animated equalizer and speed switcher."""
+    """Return the accessible, responsive click-to-play HTML player widget with animated equalizer and speed switcher.
+
+    *filename* is escaped because the legacy-upgrade path reuses a name parsed
+    out of existing note HTML rather than one this add-on generated.
+    """
+    filename = html.escape(str(filename), quote=True)
     return (
         f'<div class="neuroicu-tts-player" style="margin-top: 10px; margin-bottom: 6px; display: inline-flex; align-items: center; gap: 8px; font-family: -apple-system, BlinkMacSystemFont, \'Segoe UI\', Roboto, Helvetica, Arial, sans-serif;">'
         f'<audio class="neuroicu-audio" src="{filename}" preload="none" '
@@ -126,10 +141,11 @@ def managed_extra(extra: str, filename: str, digest: str, profile_digest: str | 
     """
     value = MANAGED_BLOCK_RE.sub("", extra or "").rstrip()
     marker = f"v2:{digest}:{profile_digest}" if profile_digest else f"v1:{digest}"
-    if legacy_sound_tag:
-        suffix = f"\n\n<!-- neuroicu-tts:{marker} --> [sound:{filename}]"
-    else:
-        suffix = f"\n\n<!-- neuroicu-tts:{marker} -->\n{player_html(filename)}"
+    suffix = (
+        f"\n\n<!-- neuroicu-tts:{marker} --> [sound:{filename}]"
+        if legacy_sound_tag
+        else f"\n\n<!-- neuroicu-tts:{marker} -->\n{player_html(filename)}"
+    )
     return value + suffix
 
 
